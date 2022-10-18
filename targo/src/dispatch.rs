@@ -115,15 +115,17 @@ impl CargoArgsWithData {
                     };
                     manifest_path = Some(PathBuf::from(new_manifest_path.clone()));
                     // Also pass through the manifest path to the underlying cargo command.
+
+                    cli_args.push("--manifest-path".into());
                 }
                 Long(other) => {
-                    cli_args.push(other.into());
+                    cli_args.push(format!("--{other}").into());
                     if let Some(val) = parser.optional_value() {
                         cli_args.push(val);
                     }
                 }
                 Short(arg) => {
-                    cli_args.push(OsString::from(arg.to_string()));
+                    cli_args.push(format!("-{arg}").into());
                     if let Some(val) = parser.optional_value() {
                         cli_args.push(val);
                     }

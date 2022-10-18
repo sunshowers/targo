@@ -1,14 +1,38 @@
 use camino::Utf8PathBuf;
+use clap::{Parser, Subcommand};
 use color_eyre::{
     eyre::{bail, WrapErr},
     Result,
 };
+use lexopt::prelude::*;
 use std::{ffi::OsString, fmt, path::PathBuf, process::Command};
 
-use lexopt::{prelude::*, Parser};
+#[derive(Debug, Parser)]
+pub struct TargoApp {
+    // TODO: command
+    #[command(subcommand)]
+    command: TargoCommand,
+}
 
-pub fn main_impl() -> Result<()> {
-    let parser = Parser::from_env();
+#[derive(Debug, Subcommand)]
+pub enum TargoCommand {
+    /// Wrap cargo and pass through commands.
+    WrapCargo {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
+}
+
+impl TargoApp {
+    pub fn exec(self) -> Result<()> {
+        match self.command {
+            TargoCommand::WrapCargo { args } => exec_wrap_cargo(args),
+        }
+    }
+}
+
+fn exec_wrap_cargo(args: Vec<OsString>) -> Result<()> {
+    let parser = lexopt::Parser::from_args(args);
     let args_with_data = CargoArgsWithData::from_parser(parser)?;
 
     // Find the target directory destination.
@@ -68,7 +92,7 @@ struct CargoArgsWithData {
 }
 
 impl CargoArgsWithData {
-    fn from_parser(mut parser: Parser) -> Result<Self> {
+    fn from_parser(mut parser: lexopt::Parser) -> Result<Self> {
         // TODO: intercept cargo clean -- it doesn't work right now, it should clean the symlink
         // target.
 

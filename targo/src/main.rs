@@ -1,4 +1,7 @@
+use clap::Parser;
+
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
-    targo::main_impl()
+    let app = targo::TargoApp::parse();
+    app.exec()
 }

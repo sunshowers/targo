@@ -35,14 +35,14 @@ impl TargoApp {
 
 fn exec_wrap_cargo(args: Vec<OsString>) -> Result<()> {
     let parser = lexopt::Parser::from_args(args);
-    let args_with_data = CargoArgsWithData::from_parser(parser)?;
+    let args = WrapCargoArgs::from_parser(parser)?;
 
     // Find the target directory destination.
     let targo_base = find_targo_dir_base()?;
 
     // TODO: read --target-dir/build.target-dir from cargo.
 
-    let target_dir = args_with_data.target_dir();
+    let target_dir = args.target_dir();
     let (exists, should_create) = match target_dir.symlink_metadata() {
         Ok(metadata) => (true, !metadata.is_symlink()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => (false, true),
@@ -55,9 +55,7 @@ fn exec_wrap_cargo(args: Vec<OsString>) -> Result<()> {
     // Is the target directory already a symlink? If so, don't touch it.
     if should_create {
         // Create a symlink to the destination directory.
-        let dest = targo_base
-            .join(args_with_data.hash_workspace_dir())
-            .join("target");
+        let dest = targo_base.join(args.hash_workspace_dir()).join("target");
         std::fs::create_dir_all(&dest)
             .wrap_err_with(|| format!("failed to create target dir {dest}"))?;
 
@@ -82,18 +80,18 @@ fn exec_wrap_cargo(args: Vec<OsString>) -> Result<()> {
         })?;
     }
 
-    args_with_data.cargo_command().run_or_exec()?;
+    args.cargo_command().run_or_exec()?;
 
     Ok(())
 }
 
 #[derive(Clone, Debug)]
-struct CargoArgsWithData {
+struct WrapCargoArgs {
     cli_args: Vec<OsString>,
     workspace_dir: Utf8PathBuf,
 }
 
-impl CargoArgsWithData {
+impl WrapCargoArgs {
     fn from_parser(mut parser: lexopt::Parser) -> Result<Self> {
         // TODO: intercept cargo clean -- it doesn't work right now, it should clean the symlink
         // target.

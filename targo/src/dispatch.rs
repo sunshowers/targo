@@ -17,11 +17,17 @@ pub fn main_impl() -> Result<()> {
     // TODO: read --target-dir/build.target-dir from cargo.
 
     let target_dir = args_with_data.target_dir();
-    let metadata = target_dir
-        .metadata()
-        .wrap_err_with(|| format!("failed to read metadata for target dir `{target_dir}`"))?;
+    let (exists, should_create) = match target_dir.symlink_metadata() {
+        Ok(metadata) => (true, metadata.is_symlink()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => (false, true),
+        Err(err) => {
+            return Err::<(), _>(err)
+                .wrap_err_with(|| format!("failed to read metadata for target dir `{target_dir}`"))
+        }
+    };
+
     // Is the target directory already a symlink? If so, don't touch it.
-    if !metadata.is_symlink() {
+    if should_create {
         // Create a symlink to the destination directory.
         let dest = targo_base
             .join(args_with_data.hash_workspace_dir())
@@ -29,15 +35,18 @@ pub fn main_impl() -> Result<()> {
         std::fs::create_dir_all(&dest)
             .wrap_err_with(|| format!("failed to create target dir {dest}"))?;
 
-        // TODO: do something better than rm -rf target/ here!
-        match std::fs::remove_dir_all(&target_dir) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                // The directory doesn't exist. Skip this.
-            }
-            Err(err) => {
-                Err::<(), _>(err)
-                    .wrap_err_with(|| format!("failed to remove old target dir `{target_dir}`"))?;
+        if exists {
+            // TODO: do something better than rm -rf target/ here!
+            match std::fs::remove_dir_all(&target_dir) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    // The directory doesn't exist. Skip this.
+                }
+                Err(err) => {
+                    Err::<(), _>(err).wrap_err_with(|| {
+                        format!("failed to remove old target dir `{target_dir}`")
+                    })?;
+                }
             }
         }
 
@@ -60,6 +69,9 @@ struct CargoArgsWithData {
 
 impl CargoArgsWithData {
     fn from_parser(mut parser: Parser) -> Result<Self> {
+        // TODO: intercept cargo clean -- it doesn't work right now, it should clean the symlink
+        // target.
+
         let mut cli_args = Vec::new();
         let mut manifest_path = None;
         while let Some(arg) = parser.next()? {

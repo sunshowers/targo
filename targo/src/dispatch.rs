@@ -10,6 +10,7 @@ use std::{ffi::OsString, path::PathBuf};
 use crate::cargo_cli::CargoCli;
 
 #[derive(Debug, Parser)]
+#[command(version)]
 pub struct TargoApp {
     // TODO: command
     #[command(subcommand)]
@@ -18,8 +19,10 @@ pub struct TargoApp {
 
 #[derive(Debug, Subcommand)]
 pub enum TargoCommand {
-    /// Wrap cargo and pass through commands.
+    /// Wrap Cargo and pass through commands.
+    #[command(disable_help_flag = true)]
     WrapCargo {
+        /// The arguments to pass through to Cargo.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
     },

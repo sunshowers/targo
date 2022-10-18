@@ -18,7 +18,7 @@ pub fn main_impl() -> Result<()> {
 
     let target_dir = args_with_data.target_dir();
     let (exists, should_create) = match target_dir.symlink_metadata() {
-        Ok(metadata) => (true, metadata.is_symlink()),
+        Ok(metadata) => (true, !metadata.is_symlink()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => (false, true),
         Err(err) => {
             return Err::<(), _>(err)

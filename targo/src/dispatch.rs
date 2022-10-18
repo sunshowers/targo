@@ -118,7 +118,7 @@ impl CargoArgsWithData {
                     manifest_path = Some(PathBuf::from(new_manifest_path.clone()));
 
                     // Also pass through the manifest path to the underlying cargo command.
-                    cli_args.extend(["--manifest-path".into(), new_manifest_path.into()]);
+                    cli_args.extend(["--manifest-path".into(), new_manifest_path]);
                 }
                 Long(other) => {
                     cli_args.push(format!("--{other}").into());
@@ -146,7 +146,7 @@ impl CargoArgsWithData {
         let mut locate_project_output = String::from_utf8(workspace_dir)
             .wrap_err_with(|| format!("`{locate_project}` produced invalid UTF-8 output"))?;
         // Last character of workspace_dir_str must be a newline.
-        if locate_project_output.chars().last() != Some('\n') {
+        if !locate_project_output.ends_with('\n') {
             bail!("`{locate_project}` produced output not terminated with a newline: {locate_project_output}");
         }
         locate_project_output.pop();

@@ -7,7 +7,7 @@ use color_eyre::{
 use lexopt::prelude::*;
 use std::{ffi::OsString, path::PathBuf};
 
-use crate::cargo_cli::CargoCli;
+use crate::{cargo_cli::CargoCli, store::TargoStore};
 
 #[derive(Debug, Parser)]
 #[command(version)]
@@ -41,47 +41,11 @@ fn exec_wrap_cargo(args: Vec<OsString>) -> Result<()> {
     let args = WrapCargoArgs::from_parser(parser)?;
 
     // Find the target directory destination.
-    let targo_base = find_targo_dir_base()?;
+    let store_dir = find_targo_store_dir()?;
+    let store = TargoStore::new(store_dir)?;
 
-    // TODO: read --target-dir/build.target-dir from cargo.
-
-    let target_dir = args.target_dir();
-    let (exists, should_create) = match target_dir.symlink_metadata() {
-        Ok(metadata) => (true, !metadata.is_symlink()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => (false, true),
-        Err(err) => {
-            return Err::<(), _>(err)
-                .wrap_err_with(|| format!("failed to read metadata for target dir `{target_dir}`"))
-        }
-    };
-
-    // Is the target directory already a symlink? If so, don't touch it.
-    if should_create {
-        // Create a symlink to the destination directory.
-        let dest = targo_base.join(args.hash_workspace_dir()).join("target");
-        std::fs::create_dir_all(&dest)
-            .wrap_err_with(|| format!("failed to create target dir {dest}"))?;
-
-        if exists {
-            // TODO: do something better than rm -rf target/ here!
-            match std::fs::remove_dir_all(&target_dir) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    // The directory doesn't exist. Skip this.
-                }
-                Err(err) => {
-                    Err::<(), _>(err).wrap_err_with(|| {
-                        format!("failed to remove old target dir `{target_dir}`")
-                    })?;
-                }
-            }
-        }
-
-        // Create the symlink now.
-        std::os::unix::fs::symlink(&dest, &target_dir).wrap_err_with(|| {
-            format!("failed to create symlink from `{target_dir}` to `{dest}`")
-        })?;
-    }
+    let kind = store.determine_target_dir(&args.workspace_dir, &args.target_dir)?;
+    store.actualize_kind(kind)?;
 
     args.cargo_command().run_or_exec()?;
 
@@ -92,6 +56,7 @@ fn exec_wrap_cargo(args: Vec<OsString>) -> Result<()> {
 struct WrapCargoArgs {
     cli_args: Vec<OsString>,
     workspace_dir: Utf8PathBuf,
+    target_dir: Utf8PathBuf,
 }
 
 impl WrapCargoArgs {
@@ -158,15 +123,14 @@ impl WrapCargoArgs {
         }
         workspace_dir.pop();
 
+        // TODO: read --target-dir/build.target-dir from cargo.
+        let target_dir = workspace_dir.join("target");
+
         Ok(Self {
             cli_args,
             workspace_dir,
+            target_dir,
         })
-    }
-
-    fn target_dir(&self) -> Utf8PathBuf {
-        // TODO: read --target-dir/build.target-dir from cargo.
-        self.workspace_dir.join("target")
     }
 
     fn cargo_command(&self) -> CargoCli {
@@ -174,17 +138,9 @@ impl WrapCargoArgs {
         cli.args(&self.cli_args);
         cli
     }
-
-    fn hash_workspace_dir(&self) -> String {
-        let mut hasher = blake3::Hasher::new_keyed(TARGO_HASHER_KEY);
-        hasher.update(self.workspace_dir.as_str().as_bytes());
-        bs58::encode(&hasher.finalize().as_bytes()[..20]).into_string()
-    }
 }
 
-static TARGO_HASHER_KEY: &[u8; 32] = b"targo\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
-
-fn find_targo_dir_base() -> Result<Utf8PathBuf> {
+fn find_targo_store_dir() -> Result<Utf8PathBuf> {
     let dir = home::cargo_home().wrap_err("unable to determine cargo home dir")?;
     let mut utf8_dir: Utf8PathBuf = dir
         .clone()

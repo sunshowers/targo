@@ -1,9 +1,8 @@
-use std::{ffi::OsString, fmt, process::Command};
-
 use color_eyre::{
     eyre::{bail, Context},
     Result,
 };
+use std::{ffi::OsString, fmt, process::Command};
 
 #[derive(Clone, Debug)]
 pub(crate) struct CargoCli {

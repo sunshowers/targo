@@ -1,3 +1,4 @@
+use crate::{cargo_cli::CargoCli, store::TargoStore};
 use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
 use color_eyre::{
@@ -6,8 +7,6 @@ use color_eyre::{
 };
 use lexopt::prelude::*;
 use std::{ffi::OsString, path::PathBuf};
-
-use crate::{cargo_cli::CargoCli, store::TargoStore};
 
 #[derive(Debug, Parser)]
 #[command(version)]

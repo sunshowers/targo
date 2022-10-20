@@ -1,10 +1,9 @@
-use std::collections::BTreeSet;
-
 use camino::{Utf8Path, Utf8PathBuf};
 use chrono::{DateTime, Local};
 use color_eyre::{eyre::bail, Result};
 use semver::Version;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]

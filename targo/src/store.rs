@@ -1,33 +1,34 @@
 use crate::{
-    helpers::{read_metadata, write_metadata, ExclusiveRoot, UnlockedRoot},
+    helpers::{AsLockedCtx, DirWithPath, ExclusiveRoot, UnlockedRoot},
     metadata::{TargetDirMetadata, TargoStoreMetadata},
 };
 use camino::{Utf8Path, Utf8PathBuf};
+use cap_std::{ambient_authority, fs_utf8::Dir};
 use color_eyre::{eyre::Context, Result};
 
 #[derive(Debug)]
 pub(crate) struct TargoStore {
-    store_dir: Utf8PathBuf,
-    metadata_path: Utf8PathBuf,
+    store_dir: DirWithPath,
 }
 
 impl TargoStore {
-    pub(crate) fn new(store_dir: Utf8PathBuf) -> Result<Self> {
-        // Create the store directory if it doesn't exist.
-        std::fs::create_dir_all(&store_dir)
-            .wrap_err_with(|| format!("failed to create targo store directory `{store_dir}`"))?;
+    pub(crate) fn new(store_dir_path: Utf8PathBuf) -> Result<Self> {
+        let authority = ambient_authority();
+        Dir::create_ambient_dir_all(&store_dir_path, authority).wrap_err_with(|| {
+            format!("failed to create targo store directory `{store_dir_path}`")
+        })?;
+        let store_dir = Dir::open_ambient_dir(&store_dir_path, authority)
+            .wrap_err_with(|| format!("failed to open targo store directory `{store_dir_path}`"))?;
+        let store_dir = DirWithPath::new(store_dir, store_dir_path);
 
-        // Does the directory already have Targo metadata stored in it?
-        let metadata_path = store_dir.join(TargoStoreMetadata::METADATA_FILE_NAME);
-        let store = Self {
-            store_dir,
-            metadata_path,
-        };
+        let store = Self { store_dir };
 
         let store = UnlockedRoot::new(store)?.lock_exclusive()?;
+
         // TODO: hold lock open while TargoStore is held, so per-directory metadata can be written
         // safely
 
+        // Does the directory already have Targo metadata stored in it?
         let metadata = Self::read_store_metadata(&store)?;
 
         let metadata_to_write = match &metadata {
@@ -63,8 +64,8 @@ impl TargoStore {
             }
         };
 
-        // This is a directory and is eligible for being converted to Targo.
         let kind = if symlink_metadata.is_dir() {
+            // This is a directory and is eligible for being converted to Targo.
             TargetDirKind::Directory {
                 workspace_dir: workspace_dir.to_owned(),
                 target_dir: target_dir.to_owned(),
@@ -80,8 +81,8 @@ impl TargoStore {
 
             // Is this a symlink managed by this installation of Targo?
             // (TODO: be able to operate on other installations of Targo maybe?)
-            if self.is_double_ancestor_of(&dest_dir) {
-                let managed_dir = ManagedTargetDir::new(target_dir.to_owned(), dest_dir)?;
+            if let Some(hash) = get_workspace_hash(self.store_dir.path(), &dest_dir) {
+                let managed_dir = ManagedTargetDir::new(self, target_dir.to_owned(), hash)?;
                 TargetDirKind::TargoSymlink(managed_dir)
             } else {
                 TargetDirKind::Other
@@ -119,9 +120,12 @@ impl TargoStore {
     // ---
 
     fn read_store_metadata(store: &ExclusiveRoot<Self>) -> Result<Option<TargoStoreMetadata>> {
-        let metadata: Option<TargoStoreMetadata> = read_metadata(&store.ctx.metadata_path)?;
+        let metadata: Option<TargoStoreMetadata> = store
+            .ctx
+            .store_dir
+            .read_metadata(TargoStoreMetadata::METADATA_FILE_NAME)?;
         let metadata = if let Some(metadata) = metadata {
-            Some(metadata.verify(&store.ctx.store_dir)?)
+            Some(metadata.verify(store.ctx.store_dir.path())?)
         } else {
             None
         };
@@ -132,7 +136,10 @@ impl TargoStore {
         store: &ExclusiveRoot<Self>,
         metadata: &TargoStoreMetadata,
     ) -> Result<()> {
-        write_metadata(&store.ctx.metadata_path, metadata)
+        store
+            .ctx
+            .store_dir
+            .write_metadata(TargoStoreMetadata::METADATA_FILE_NAME, metadata)
     }
 
     fn setup_target_dir(
@@ -157,32 +164,26 @@ impl TargoStore {
         }
 
         // Create the managed target directory and symlink.
-        let dest_dir = self.store_dir.join(hash_workspace_dir(&workspace_dir));
-        let managed_dir = ManagedTargetDir::new(target_dir, dest_dir.join("target"))?;
+        let hash = hash_workspace_dir(&workspace_dir);
+        let managed_dir = ManagedTargetDir::new(self, target_dir, &hash)?;
 
         // Create the symlink.
         // TODO: Windows
-        std::os::unix::fs::symlink(&managed_dir.dest_dir, &managed_dir.source_link).wrap_err_with(
-            || {
+        std::os::unix::fs::symlink(&managed_dir.target_dir, &managed_dir.source_link)
+            .wrap_err_with(|| {
                 format!(
                     "failed to create symlink from `{}` to `{}`",
-                    managed_dir.source_link, managed_dir.dest_dir
+                    managed_dir.source_link, managed_dir.target_dir
                 )
-            },
-        )?;
+            })?;
 
         Ok(managed_dir)
     }
-
-    #[inline]
-    fn is_double_ancestor_of(&self, path: &Utf8Path) -> bool {
-        is_double_ancestor_of(&self.store_dir, path)
-    }
 }
 
-impl AsRef<Utf8Path> for TargoStore {
-    fn as_ref(&self) -> &Utf8Path {
-        &self.metadata_path
+impl AsLockedCtx for TargoStore {
+    fn dir_and_lock_name(&self) -> (&DirWithPath, &str) {
+        (&self.store_dir, "targo.lock")
     }
 }
 
@@ -204,53 +205,65 @@ pub(crate) enum TargetDirKind {
 #[derive(Debug)]
 pub(crate) struct ManagedTargetDir {
     source_link: Utf8PathBuf,
-    dest_dir: Utf8PathBuf,
+    #[allow(dead_code)]
+    dest_dir: DirWithPath,
+    target_dir: Utf8PathBuf,
 }
 
 impl ManagedTargetDir {
-    fn new(source_link: Utf8PathBuf, dest_dir: Utf8PathBuf) -> Result<Self> {
+    fn new(store: &TargoStore, source_link: Utf8PathBuf, hash: &str) -> Result<Self> {
         // Create the directory if it doesn't exist.
-        std::fs::create_dir_all(&dest_dir)
-            .wrap_err_with(|| format!("failed to create managed target directory `{dest_dir}`"))?;
-
-        let metadata_path = dest_dir
-            .parent()
-            .expect("dest dir should not be root")
-            .join(TargetDirMetadata::METADATA_FILE_NAME);
+        let dest_dir_path = store.store_dir.path().join(hash);
+        let target_dir = dest_dir_path.join("target");
+        store
+            .store_dir
+            .dir()
+            .create_dir_all(hash)
+            .wrap_err_with(|| {
+                format!("failed to create managed target directory `{dest_dir_path}`")
+            })?;
+        let dest_dir = store.store_dir.dir().open_dir(hash).wrap_err_with(|| {
+            format!("failed to open managed target directory `{dest_dir_path}`")
+        })?;
+        let dest_dir = DirWithPath::new(dest_dir, dest_dir_path);
 
         let mut metadata =
-            Self::read_dir_metadata(&metadata_path)?.unwrap_or_else(TargetDirMetadata::new);
+            Self::read_dir_metadata(&dest_dir)?.unwrap_or_else(TargetDirMetadata::new);
         // TODO: check existing backlinks
         metadata.backlinks.insert(source_link.clone());
         metadata.update_last_used();
 
-        Self::write_dir_metadata(&metadata_path, &metadata)?;
+        Self::write_dir_metadata(&dest_dir, &metadata)?;
 
         Ok(Self {
             source_link,
             dest_dir,
+            target_dir,
         })
     }
 
-    fn read_dir_metadata(metadata_path: &Utf8Path) -> Result<Option<TargetDirMetadata>> {
-        read_metadata(metadata_path)
+    fn read_dir_metadata(dest_dir: &DirWithPath) -> Result<Option<TargetDirMetadata>> {
+        dest_dir.read_metadata(TargetDirMetadata::METADATA_FILE_NAME)
     }
 
-    fn write_dir_metadata(metadata_path: &Utf8Path, metadata: &TargetDirMetadata) -> Result<()> {
-        write_metadata(metadata_path, metadata)
+    fn write_dir_metadata(dest_dir: &DirWithPath, metadata: &TargetDirMetadata) -> Result<()> {
+        dest_dir.write_metadata(TargetDirMetadata::METADATA_FILE_NAME, metadata)
     }
 }
 
-fn is_double_ancestor_of(store_dir: &Utf8Path, path: &Utf8Path) -> bool {
+fn get_workspace_hash<'a, 'b>(store_dir: &'a Utf8Path, path: &'b Utf8Path) -> Option<&'b str> {
     // Don't touch relative symlinks.
     if !path.is_absolute() {
-        return false;
+        return None;
     }
 
-    fn imp(store_dir: &Utf8Path, path: &Utf8Path) -> Option<bool> {
-        Some(path.parent()?.parent()? == store_dir)
+    let suffix = path.strip_prefix(store_dir).ok()?;
+    // Ensure the suffix has two components.
+    if suffix.components().count() == 2 {
+        suffix.iter().next()
+    } else {
+        None
     }
-    imp(store_dir, path).unwrap_or_default()
 }
 
 static TARGO_HASHER_KEY: &[u8; 32] = b"targo\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
@@ -266,17 +279,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_double_ancestor_of() {
-        assert!(is_double_ancestor_of(
-            "/foo/bar".into(),
-            "/foo/bar/baz/quux".into()
-        ));
-        assert!(!is_double_ancestor_of(
-            "/foo/bar".into(),
-            "/foo/bar/baz".into()
-        ));
-        assert!(!is_double_ancestor_of("/foo/bar".into(), "/".into()));
-        assert!(!is_double_ancestor_of("/foo/bar".into(), "".into()));
-        assert!(!is_double_ancestor_of("/foo/bar".into(), "../foo".into()));
+    fn test_get_workspace_hash() {
+        assert_eq!(
+            get_workspace_hash("/foo/bar".into(), "/foo/bar/baz/quux".into()),
+            Some("baz"),
+        );
+        assert_eq!(
+            get_workspace_hash("/foo/bar".into(), "/foo/bar/baz".into()),
+            None
+        );
+        assert_eq!(get_workspace_hash("/foo/bar".into(), "/".into()), None);
+        assert_eq!(get_workspace_hash("/foo/bar".into(), "".into()), None);
+        assert_eq!(get_workspace_hash("/foo/bar".into(), "../foo".into()), None);
     }
 }

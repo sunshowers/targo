@@ -50,11 +50,13 @@ jobs:
           - ubuntu-latest
           - macos-latest
           # - windows-latest
-        rust-version: stable
+        rust-version: [ stable ]
       fail-fast: false
     steps:
       - uses: actions/checkout@v3
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust-version }}
       - uses: Swatinem/rust-cache@v2
         with:
           # Matrix instances (other than OS) need to be added to this explicitly

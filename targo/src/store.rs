@@ -218,7 +218,7 @@ impl ManagedTargetDir {
         store
             .store_dir
             .dir()
-            .create_dir_all(hash)
+            .create_dir_all(Utf8Path::new(hash).join("target"))
             .wrap_err_with(|| {
                 format!("failed to create managed target directory `{dest_dir_path}`")
             })?;

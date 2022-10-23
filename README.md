@@ -20,7 +20,7 @@ See [this comment on rust-lang/cargo](https://github.com/rust-lang/cargo/issues/
 
 ## Looking for co-maintainers
 
-This MVP works for myself and I only plan to add features as I need them. If you're a Rust developer who cares about this issue, and would like to help drive this project forward, please reach out to me at the email I use for my git commits with:
+This MVP works for me and I only plan to add features as I need them. If you're a Rust developer who cares about this issue, and would like to help drive this project forward, please reach out to me at the email I use for my git commits with:
 * some information about yourself
 * why you're interested
 * where you'd like to take this project
@@ -31,3 +31,4 @@ There's plenty to do:
 * add target directory management and garbage collection
 * add configuration options
 * stay up-to-date with upstream Cargo features
+* add Windows support

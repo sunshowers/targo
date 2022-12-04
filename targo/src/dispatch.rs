@@ -214,7 +214,7 @@ mod tests {
             let cargo_command = args.cargo_command();
             let output = cargo_command
                 .get_args()
-                .into_iter()
+                .iter()
                 .map(|s| s.to_str().expect("inputs were valid strings"));
             let output = shell_words::join(output);
 

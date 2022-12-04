@@ -20,3 +20,6 @@ serde_json = "1.0.86"
 home = "0.5.4"
 bs58 = "0.4.0"
 clap = { version = "4.0.17", features = ["derive"] }
+
+[dev-dependencies]
+shell-words = "1.1.0"

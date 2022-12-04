@@ -19,12 +19,22 @@ impl CargoCli {
         }
     }
 
+    pub(crate) fn arg(&mut self, arg: impl Into<OsString>) -> &mut Self {
+        self.args.push(arg.into());
+        self
+    }
+
     pub(crate) fn args(
         &mut self,
         args: impl IntoIterator<Item = impl Into<OsString>>,
     ) -> &mut Self {
         self.args.extend(args.into_iter().map(|arg| arg.into()));
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get_args(&self) -> &[OsString] {
+        &self.args
     }
 
     pub(crate) fn stdout_output(&self) -> Result<Vec<u8>> {

@@ -63,6 +63,7 @@ impl CargoCli {
 
         // TODO: Windows, can't exec there -- must run and propagate error etc
         let mut command = self.make_command();
+        tracing::debug!("running command: {self}");
         Err(command.exec().into())
     }
 

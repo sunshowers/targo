@@ -8,8 +8,9 @@ use color_eyre::{
 use lexopt::prelude::*;
 use std::{
     ffi::{OsStr, OsString},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
+use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
 #[command(version)]
@@ -36,6 +37,8 @@ pub enum TargoCommand {
 
 impl TargoApp {
     pub fn exec(self) -> Result<()> {
+        let filter = EnvFilter::from_env("TARGO_LOG");
+        tracing_subscriber::fmt().with_env_filter(filter).init();
         match self.command {
             TargoCommand::WrapCargo { args } => exec_wrap_cargo(args),
         }
@@ -136,26 +139,46 @@ impl ParsedCargoArgs {
                         }
                     };
                     manifest_path = Some(PathBuf::from(new_manifest_path.clone()));
+                    tracing::debug!(
+                        "setting manifest-path to {}",
+                        Path::new(&new_manifest_path).display()
+                    );
 
                     // Also pass through the manifest path to the underlying cargo command.
                     cli_args.extend(["--manifest-path".into(), new_manifest_path]);
                 }
                 Long(other) => {
-                    cli_args.push(format!("--{other}").into());
+                    let other = other.to_owned();
                     if let Some(val) = parser.optional_value() {
-                        cli_args.push(val);
+                        tracing::debug!("long arg: {other} with optional value: {val:?}");
+                        let mut arg = OsString::from(format!("--{other}="));
+                        arg.push(&val);
+                        cli_args.push(arg);
+                    } else {
+                        tracing::debug!("long arg: {other} without optional value");
+                        cli_args.push(format!("--{other}").into());
                     }
                 }
                 Short(arg) => {
                     cli_args.push(format!("-{arg}").into());
                     if let Some(val) = parser.optional_value() {
-                        cli_args.push(val);
+                        tracing::debug!("short arg: {arg} with optional value: {val:?}");
+                        let mut arg = OsString::from(format!("-{arg}="));
+                        arg.push(&val);
+                        cli_args.push(arg);
+                    } else {
+                        tracing::debug!("short arg: {arg} without optional value");
+                        cli_args.push(format!("-{arg}").into());
                     }
                 }
                 Value(value) => {
                     if seen_double_hyphen {
+                        tracing::debug!(
+                            "argument {value:?}, post-double-hyphen so treating literally"
+                        );
                         post_double_hyphen.push(value);
                     } else {
+                        tracing::debug!("argument {value:?}");
                         cli_args.push(value);
                     }
                 }

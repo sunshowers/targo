@@ -251,7 +251,7 @@ impl ManagedTargetDir {
     }
 }
 
-fn get_workspace_hash<'a, 'b>(store_dir: &'a Utf8Path, path: &'b Utf8Path) -> Option<&'b str> {
+fn get_workspace_hash<'b>(store_dir: &Utf8Path, path: &'b Utf8Path) -> Option<&'b str> {
     // Don't touch relative symlinks.
     if !path.is_absolute() {
         return None;

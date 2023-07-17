@@ -14,6 +14,12 @@ Then, add this to your .zshrc/.bash_profile:
 alias cargo='targo wrap-cargo'
 ```
 
+To bypass targo, prefix the command with a backslash on the command line (should work in all Bourne shells at least):
+
+```
+$ \cargo build
+```
+
 ## About
 
 See [this comment on rust-lang/cargo](https://github.com/rust-lang/cargo/issues/11156#issuecomment-1285951209) for the execution model and considerations as of 2022-10-22.

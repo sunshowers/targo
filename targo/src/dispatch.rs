@@ -160,7 +160,6 @@ impl ParsedCargoArgs {
                     }
                 }
                 Short(arg) => {
-                    cli_args.push(format!("-{arg}").into());
                     if let Some(val) = parser.optional_value() {
                         tracing::debug!("short arg: {arg} with optional value: {val:?}");
                         let mut arg = OsString::from(format!("-{arg}="));

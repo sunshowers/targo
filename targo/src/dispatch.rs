@@ -223,24 +223,25 @@ mod tests {
     fn test_parse_wrap_cargo_args() -> Result<()> {
         let data = [
             "build -p foo",
+            "build -p=foo",
             "test",
             "clippy --package baz --manifest-path test",
+            "clippy --package=baz",
             "check --all-targets -- -Dwarnings",
             "run --package baz -- -- arg1 arg2",
         ];
         for input in data {
             let input_args = shell_words::split(input)?;
-            let parser = lexopt::Parser::from_args(input_args);
+            let parser = lexopt::Parser::from_args(input_args.clone());
             let args = ParsedCargoArgs::from_parser(parser)?;
 
             let cargo_command = args.cargo_command();
-            let output = cargo_command
+            let output: Vec<_> = cargo_command
                 .get_args()
                 .iter()
-                .map(|s| s.to_str().expect("inputs were valid strings"));
-            let output = shell_words::join(output);
-
-            assert_eq!(input, &output, "input matches output");
+                .map(|s| s.to_str().expect("inputs were valid strings").to_owned())
+                .collect();
+            assert_eq!(input_args, output, "input matches output");
         }
 
         Ok(())

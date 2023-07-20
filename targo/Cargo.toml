@@ -15,7 +15,7 @@ lexopt = { version = "0.3.0" }
 color-eyre = { version = "0.6.2", default-features = false }
 shell-words = { version = "1.1.0" }
 semver = { version = "1.0.18", features = ["serde"] }
-serde = { version = "1.0.171", features = ["derive"] }
+serde = { version = "1.0.173", features = ["derive"] }
 serde_json = "1.0.103"
 tracing = "0.1.37"
 tracing-subscriber = { version = "0.3.17", features = ["fmt", "env-filter"] }

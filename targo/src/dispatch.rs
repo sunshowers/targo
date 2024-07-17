@@ -47,25 +47,39 @@ impl TargoApp {
 
 fn exec_wrap_cargo(args: Vec<OsString>) -> Result<()> {
     let parser = lexopt::Parser::from_args(args);
-    let args = WrapCargoArgs::new(parser)?;
+    let parsed_args = match WrapCargoArgs::new(parser)? {
+        WrapCargoArgs::Enabled {
+            parsed_args,
+            workspace_dir,
+            target_dir,
+        } => {
+            // Find the target directory destination.
+            let store_dir = find_targo_store_dir()?;
+            let store = TargoStore::new(store_dir)?;
 
-    // Find the target directory destination.
-    let store_dir = find_targo_store_dir()?;
-    let store = TargoStore::new(store_dir)?;
+            let kind = store.determine_target_dir(&workspace_dir, &target_dir)?;
+            store.actualize_kind(kind)?;
 
-    let kind = store.determine_target_dir(&args.workspace_dir, &args.target_dir)?;
-    store.actualize_kind(kind)?;
+            parsed_args
+        }
+        WrapCargoArgs::Disabled { parsed_args } => parsed_args,
+    };
 
-    args.parsed_args.cargo_command().run_or_exec()?;
+    parsed_args.cargo_command().run_or_exec()?;
 
     Ok(())
 }
 
 #[derive(Clone, Debug)]
-struct WrapCargoArgs {
-    parsed_args: ParsedCargoArgs,
-    workspace_dir: Utf8PathBuf,
-    target_dir: Utf8PathBuf,
+enum WrapCargoArgs {
+    Enabled {
+        parsed_args: ParsedCargoArgs,
+        workspace_dir: Utf8PathBuf,
+        target_dir: Utf8PathBuf,
+    },
+    Disabled {
+        parsed_args: ParsedCargoArgs,
+    },
 }
 
 impl WrapCargoArgs {
@@ -84,8 +98,15 @@ impl WrapCargoArgs {
             locate_project.arg(manifest_path);
         }
 
-        let workspace_dir = locate_project.stdout_output()?;
-        let mut locate_project_output = String::from_utf8(workspace_dir)
+        let output = match locate_project.stdout_output() {
+            Ok(output) => output,
+            Err(_) => {
+                eprintln!("[targo] error running cargo locate-project, disabling");
+                return Ok(Self::Disabled { parsed_args });
+            }
+        };
+
+        let mut locate_project_output = String::from_utf8(output)
             .wrap_err_with(|| format!("`{locate_project}` produced invalid UTF-8 output"))?;
         // Last character of workspace_dir_str must be a newline.
         if !locate_project_output.ends_with('\n') {
@@ -102,7 +123,7 @@ impl WrapCargoArgs {
         // TODO: read --target-dir/build.target-dir from cargo.
         let target_dir = workspace_dir.join("target");
 
-        Ok(Self {
+        Ok(Self::Enabled {
             parsed_args,
             workspace_dir,
             target_dir,

@@ -1,9 +1,13 @@
+use atomicwrites::{AtomicFile, OverwriteBehavior};
 use camino::{Utf8Path, Utf8PathBuf};
 use cap_std::fs_utf8::Dir;
 use color_eyre::{eyre::Context, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use std::{fs, io};
+use std::{
+    fmt, fs,
+    io::{self, Write},
+};
 
 #[derive(Debug)]
 pub(crate) struct UnlockedRoot<T> {
@@ -142,20 +146,17 @@ impl DirWithPath {
 
     pub(crate) fn write_metadata<T>(&self, file_name: &str, metadata: &T) -> Result<()>
     where
-        T: Serialize,
+        T: Serialize + fmt::Debug,
     {
-        let writer = io::BufWriter::new(self.dir.create(file_name).wrap_err_with(|| {
-            format!(
-                "failed to create targo metadata file `{}`",
-                self.path.join(file_name)
-            )
-        })?);
-        serde_json::to_writer(writer, metadata).wrap_err_with(|| {
-            format!(
-                "failed to serialize metadata to `{}`",
-                self.path.join(file_name)
-            )
-        })?;
+        // cap-std doesn't expose a way to write files atomically, so we use the path directly.
+        let json = serde_json::to_string(metadata)
+            .wrap_err_with(|| format!("failed to serialize metadata {metadata:?}",))?;
+
+        let path = self.path.join(file_name);
+        let file = AtomicFile::new(&path, OverwriteBehavior::AllowOverwrite);
+        file.write(|f| f.write_all(json.as_bytes()))
+            .wrap_err_with(|| format!("failed to write metadata to `{}`", path))?;
+
         Ok(())
     }
 }

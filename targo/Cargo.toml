@@ -5,23 +5,24 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+atomicwrites = "0.4.3"
 blake3 = "1.4.1"
+bs58 = "0.5.0"
 camino = { version = "1.1.6", features = ["serde1"] }
 cap-std = { version = "2.0.0", features = ["fs_utf8"] }
 chrono = { version = "0.4.26", features = ["serde"] }
-fs2 = "0.4.3"
-toml = "0.7.6"
-lexopt = { version = "0.3.0" }
+clap = { version = "4.3.12", features = ["derive"] }
 color-eyre = { version = "0.6.2", default-features = false }
-shell-words = { version = "1.1.0" }
+fs2 = "0.4.3"
+home = "0.5.5"
+lexopt = { version = "0.3.0" }
 semver = { version = "1.0.18", features = ["serde"] }
 serde = { version = "1.0.171", features = ["derive"] }
 serde_json = "1.0.103"
+shell-words = { version = "1.1.0" }
+toml = "0.7.6"
 tracing = "0.1.37"
 tracing-subscriber = { version = "0.3.17", features = ["fmt", "env-filter"] }
-home = "0.5.5"
-bs58 = "0.5.0"
-clap = { version = "4.3.12", features = ["derive"] }
 
 [dev-dependencies]
 shell-words = "1.1.0"

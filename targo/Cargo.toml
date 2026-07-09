@@ -6,8 +6,6 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 atomicwrites = "0.4.3"
-blake3 = "1.5.4"
-bs58 = "0.5.1"
 camino = { version = "1.1.9", features = ["serde1"] }
 cap-std = { version = "3.2.0", features = ["fs_utf8"] }
 chrono = { version = "0.4.38", features = ["serde"] }
@@ -22,6 +20,7 @@ serde_json = "1.0.127"
 shell-words = { version = "1.1.0" }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["fmt", "env-filter"] }
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 
 [dev-dependencies]
 shell-words = "1.1.0"

@@ -128,6 +128,12 @@ impl fmt::Display for BacklinkState {
     }
 }
 
+/// Where a backlink leads, when that is not the entry's target directory.
+enum Leads {
+    Elsewhere,
+    Nowhere,
+}
+
 /// Examines `backlink`, a backlink of the entry whose target directory is `entry_target`.
 fn inspect_backlink(backlink: &Utf8Path, entry_target: &Utf8Path) -> BacklinkState {
     // Targo only records absolute paths. A relative one would depend on the current directory.
@@ -139,27 +145,61 @@ fn inspect_backlink(backlink: &Utf8Path, entry_target: &Utf8Path) -> BacklinkSta
     }
 
     // Checked first: a path that leads to the target directory is live, whatever is at it.
-    match fs::metadata(backlink) {
+    let leads = match fs::metadata(backlink) {
         Ok(resolved) => match fs::metadata(entry_target) {
             // Not the path text: the same directory can be reached through several paths.
             Ok(target) if (resolved.dev(), resolved.ino()) == (target.dev(), target.ino()) => {
                 return BacklinkState::Live;
             }
-            Ok(_) => {}
+            Ok(_) => Leads::Elsewhere,
             // The entry has no target directory, so the path leads somewhere else.
-            Err(error) if is_absent(&error) => {}
+            Err(error) if is_absent(&error) => Leads::Elsewhere,
             Err(error) => return BacklinkState::Unknown(error),
         },
         // Nothing is there, or a symlink dangles.
-        Err(error) if is_absent(&error) => {}
+        Err(error) if is_absent(&error) => Leads::Nowhere,
         Err(error) => return BacklinkState::Unknown(error),
-    }
+    };
 
     match fs::symlink_metadata(backlink) {
-        Ok(metadata) if metadata.is_symlink() => BacklinkState::PointsElsewhere,
+        Ok(metadata) if metadata.is_symlink() => match leads {
+            Leads::Elsewhere => BacklinkState::PointsElsewhere,
+            Leads::Nowhere => inspect_dangling_backlink(backlink, entry_target),
+        },
         Ok(_) => BacklinkState::NotASymlink,
         Err(error) if is_absent(&error) => BacklinkState::Missing,
         Err(error) => BacklinkState::Unknown(error),
+    }
+}
+
+/// Examines `backlink`, which is a symlink that dangles.
+fn inspect_dangling_backlink(backlink: &Utf8Path, entry_target: &Utf8Path) -> BacklinkState {
+    let link_text = match fs::read_link(backlink) {
+        Ok(link_text) => link_text,
+        Err(error) => return BacklinkState::Unknown(error),
+    };
+    if !names_target_of_entry(&link_text, entry_target) {
+        return BacklinkState::PointsElsewhere;
+    }
+    match fs::metadata(entry_target) {
+        // The store has another path where the link resolves, such as in a container.
+        Ok(_) => BacklinkState::Unknown(io::Error::new(
+            io::ErrorKind::NotFound,
+            "the link names this entry by a path that does not resolve here",
+        )),
+        Err(error) if is_absent(&error) => BacklinkState::PointsElsewhere,
+        Err(error) => BacklinkState::Unknown(error),
+    }
+}
+
+/// Whether `link_text` ends as `entry_target` does, in the name of the entry and `target`.
+fn names_target_of_entry(link_text: &Path, entry_target: &Utf8Path) -> bool {
+    let entry_name = entry_target.parent().and_then(Utf8Path::file_name);
+    match (entry_name, entry_target.file_name()) {
+        (Some(entry_name), Some(target_name)) => {
+            link_text.ends_with(Utf8Path::new(entry_name).join(target_name))
+        }
+        (None, _) | (_, None) => false,
     }
 }
 
@@ -927,6 +967,29 @@ mod tests {
             ),
             (
                 root.symlink(&file, "to-file/target"),
+                StateKind::PointsElsewhere,
+            ),
+            // The entry is named, but through a path to the store that doesn't resolve here.
+            (
+                root.symlink(
+                    root.path("other-view/entry/target"),
+                    "other-view-link/target",
+                ),
+                StateKind::Unknown(io::ErrorKind::NotFound),
+            ),
+            (
+                root.symlink("../gone/store/entry/target/", "other-view-relative/target"),
+                StateKind::Unknown(io::ErrorKind::NotFound),
+            ),
+            (
+                root.symlink(
+                    root.path("other-view/not-entry/target"),
+                    "other-entry/target",
+                ),
+                StateKind::PointsElsewhere,
+            ),
+            (
+                root.symlink(root.path("other-view/entry/target/debug"), "inside/target"),
                 StateKind::PointsElsewhere,
             ),
             (root.create_dir("real-dir/target"), StateKind::NotASymlink),

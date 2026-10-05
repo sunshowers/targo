@@ -47,6 +47,14 @@ fn gc_dry_run_reports_and_changes_nothing() {
     create_symlink(Utf8Path::new("target"), &looping_link);
     let loop_error = fs::metadata(&looping_link).expect_err("a looping symlink doesn't resolve");
 
+    // As when the workspace is used in a container that has the store at another path.
+    let other_view_link = workspaces.join("other-view/target");
+    store.create_entry("other-view", &[&other_view_link], -400 * DAY);
+    create_symlink(
+        &env.root().join("container/store/other-view/target"),
+        &other_view_link,
+    );
+
     let corrupt_metadata = "{";
     let json_error = serde_json::from_str::<serde_json::Value>(corrupt_metadata)
         .expect_err("the metadata is not JSON");
@@ -81,10 +89,12 @@ fn gc_dry_run_reports_and_changes_nothing() {
          failed to deserialize metadata from `{corrupt_metadata_path}`: {json_error}\n\
          would keep `empty`: unrecognized; it has no `target-dir-metadata.json`\n\
          would keep `future`: last used 2d in the future; backlinks: `{gone_link}` (missing)\n\
+         would keep `other-view`: backlink state unknown; backlinks: `{other_view_link}` \
+         (unknown: the link names this entry by a path that does not resolve here)\n\
          would keep `unknown`: backlink state unknown; \
          backlinks: `{gone_link}` (missing), `{looping_link}` (unknown: {loop_error})\n\
-         would remove 3 entries ({}) and keep 6 entries: 1 live, 1 orphaned within grace, \
-         1 with unknown backlinks, 2 unrecognized, 1 last used in the future\n",
+         would remove 3 entries ({}) and keep 7 entries: 1 live, 1 orphaned within grace, \
+         2 with unknown backlinks, 2 unrecognized, 1 last used in the future\n",
         human_size(stale_size),
         human_size(orphan_size),
         human_size(no_backlinks_size),

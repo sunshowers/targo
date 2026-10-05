@@ -1,7 +1,10 @@
 use camino::{Utf8Path, Utf8PathBuf};
 use camino_tempfile::Utf8TempDir;
 use fs2::FileExt;
-use std::{env, fs, os::unix::fs::PermissionsExt, process::Command};
+use std::{
+    collections::BTreeMap, env, fs, os::unix::fs::PermissionsExt, process::Command,
+    time::SystemTime,
+};
 
 /// Inherited variables with these prefixes could point targo or Cargo outside the temp dir.
 const SCRUBBED_ENV_PREFIXES: [&str; 3] = ["CARGO_", "TARGO_", "XDG_"];
@@ -11,6 +14,14 @@ const SCRUBBED_ENV_PREFIXES: [&str; 3] = ["CARGO_", "TARGO_", "XDG_"];
 pub(crate) enum StoreLockState {
     Held,
     Free,
+}
+
+/// What is at a path, with its modification time.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Entry {
+    Dir(SystemTime),
+    File(SystemTime, String),
+    Symlink(SystemTime, Utf8PathBuf),
 }
 
 /// A temp dir that holds a targo store and throwaway workspaces.
@@ -65,6 +76,13 @@ impl TestEnv {
         fs::write(workspace_dir.join("Cargo.toml"), manifest).expect("wrote manifest");
         fs::write(workspace_dir.join("src/lib.rs"), "").expect("wrote src/lib.rs");
         workspace_dir
+    }
+
+    /// Records everything in the temp dir, to check that a run leaves it untouched.
+    pub(crate) fn snapshot(&self) -> BTreeMap<Utf8PathBuf, Entry> {
+        let mut entries = BTreeMap::new();
+        record_entries(&self.root, &mut entries);
+        entries
     }
 
     /// Reports the state of the store lock by trying to take it without blocking.
@@ -122,5 +140,22 @@ impl TestEnv {
             // A `cargo` found through `PATH` may be a wrapper that depends on `CARGO_HOME`.
             .env("CARGO", env!("CARGO"));
         command
+    }
+}
+
+fn record_entries(dir: &Utf8Path, entries: &mut BTreeMap<Utf8PathBuf, Entry>) {
+    for entry in dir.read_dir_utf8().expect("read dir") {
+        let path = entry.expect("read dir entry").into_path();
+        let metadata = path.symlink_metadata().expect("read metadata");
+        let modified = metadata.modified().expect("read modification time");
+        let entry = if metadata.is_symlink() {
+            Entry::Symlink(modified, path.read_link_utf8().expect("read symlink"))
+        } else if metadata.is_dir() {
+            record_entries(&path, entries);
+            Entry::Dir(modified)
+        } else {
+            Entry::File(modified, fs::read_to_string(&path).expect("read file"))
+        };
+        entries.insert(path, entry);
     }
 }

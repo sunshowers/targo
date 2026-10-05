@@ -1,12 +1,16 @@
 use atomicwrites::{AtomicFile, OverwriteBehavior};
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
 use cap_std::fs_utf8::Dir;
-use color_eyre::{eyre::Context, Result};
+use color_eyre::{
+    eyre::{bail, Context},
+    Result,
+};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
     fmt, fs,
     io::{self, Write},
+    path::PathBuf,
 };
 
 /// An exclusive lock on a lock file, held until it is unlocked or dropped.
@@ -103,5 +107,115 @@ impl DirWithPath {
             .wrap_err_with(|| format!("failed to write metadata to `{}`", path))?;
 
         Ok(())
+    }
+}
+
+/// Resolves symlinks and `..` in the absolute path `path`, which doesn't have to exist.
+///
+/// Components that don't exist are kept as they are: creating them makes real directories.
+pub(crate) fn resolve_location(path: &Utf8Path) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        bail!("`{path}` is not an absolute path");
+    }
+    let mut location = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Utf8Component::Prefix(_) | Utf8Component::RootDir => location.push(component.as_str()),
+            Utf8Component::CurDir => {}
+            Utf8Component::ParentDir => {
+                // `location` has no symlinks left in it, so its parent is the real parent.
+                location.pop();
+            }
+            Utf8Component::Normal(name) => {
+                location.push(name);
+                match location.symlink_metadata() {
+                    Ok(metadata) if metadata.is_symlink() => {
+                        location = location.canonicalize().wrap_err_with(|| {
+                            format!("failed to resolve symlink `{}`", location.display())
+                        })?;
+                    }
+                    Ok(_) => {}
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        return Err(err).wrap_err_with(|| {
+                            format!("failed to read metadata for `{}`", location.display())
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(location)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn test_resolve_location() {
+        let temp_dir = camino_tempfile::tempdir().expect("created temp dir");
+        // A temp dir can be behind a symlink (as on macOS).
+        let root = temp_dir.path().canonicalize_utf8().expect("canonicalized");
+        fs::create_dir_all(root.join("real/inner")).expect("created dirs");
+        fs::write(root.join("file"), "").expect("wrote file");
+        symlink(root.join("real/inner"), root.join("link")).expect("created symlink");
+        symlink("real", root.join("relative-link")).expect("created symlink");
+        symlink(root.join("nowhere"), root.join("dangling")).expect("created symlink");
+        symlink("relative-link/inner/..", root.join("chain")).expect("created symlink");
+        symlink("file", root.join("file-link")).expect("created symlink");
+
+        let data = [
+            ("real/inner", "real/inner"),
+            ("real/./inner/", "real/inner"),
+            ("file", "file"),
+            ("missing/dir", "missing/dir"),
+            ("link", "real/inner"),
+            ("link/missing", "real/inner/missing"),
+            ("relative-link/inner", "real/inner"),
+            ("chain/inner", "real/inner"),
+            ("file-link", "file"),
+            // `..` after a symlink is the parent of where the symlink leads.
+            ("link/..", "real"),
+            ("link/../missing", "real/missing"),
+            // `..` after a missing component is the directory that the component would be in.
+            ("missing/../link", "real/inner"),
+            ("real/missing/dir/../../../link/dir", "real/inner/dir"),
+        ];
+        for (input, expected) in data {
+            let path = root.join(input);
+            let location = resolve_location(&path).expect("resolved");
+            assert_eq!(location, root.join(expected), "for {input:?}");
+            if let Ok(canonical) = path.canonicalize() {
+                assert_eq!(
+                    location, canonical,
+                    "for {input:?}, which the OS can resolve"
+                );
+            }
+        }
+        assert_eq!(
+            resolve_location("/..".into()).expect("resolved"),
+            PathBuf::from("/"),
+            "the root is its own parent"
+        );
+
+        let error = resolve_location("real/inner".into()).expect_err("resolution failed");
+        assert_eq!(error.to_string(), "`real/inner` is not an absolute path");
+
+        let error_data = [
+            (
+                "dangling/dir",
+                format!("failed to resolve symlink `{}`", root.join("dangling")),
+            ),
+            (
+                "file/dir",
+                format!("failed to read metadata for `{}`", root.join("file/dir")),
+            ),
+        ];
+        for (input, expected) in error_data {
+            let error = resolve_location(&root.join(input)).expect_err("resolution failed");
+            assert_eq!(error.to_string(), expected, "for {input:?}");
+        }
     }
 }

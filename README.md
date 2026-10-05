@@ -20,7 +20,7 @@ To bypass targo, prefix the command with a backslash on the command line (should
 $ \cargo build
 ```
 
-Target directories are stored in `$CARGO_HOME/targo`. To store them somewhere else, set `TARGO_STORE_DIR` to an absolute path. A workspace whose `target` already links into another store keeps using that store until the link is removed.
+Target directories are stored in `$CARGO_HOME/targo`. To store them somewhere else, set `TARGO_STORE_DIR` to an absolute path. The store can't be inside a workspace's `target` directory. A workspace whose `target` already links into another store keeps using that store until the link is removed.
 
 ## About
 

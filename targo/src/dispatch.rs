@@ -1,5 +1,6 @@
 use crate::{
     cargo_cli::CargoCli,
+    helpers::resolve_location,
     store::{remove_target_dir, LockedStore, TargetDirSetup},
 };
 use camino::{Utf8Path, Utf8PathBuf};
@@ -11,9 +12,9 @@ use color_eyre::{
 use std::{
     error,
     ffi::{OsStr, OsString},
-    fmt,
+    fmt, iter,
     os::unix::ffi::OsStrExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 use tracing_subscriber::EnvFilter;
 
@@ -65,7 +66,7 @@ fn exec_wrap_cargo(args: Vec<OsString>) -> Result<()> {
                 Some(store_dir) => store_dir,
                 None => default_store_dir()?,
             };
-            let store = set_up_target_dir(store_dir, &workspace_dir, &target_dir)?;
+            let store = set_up_target_dir(&store_dir, &workspace_dir, &target_dir)?;
 
             // Cargo must not run under the store lock: a build can take a long time.
             store.unlock()?;
@@ -82,18 +83,18 @@ fn exec_wrap_cargo(args: Vec<OsString>) -> Result<()> {
 
 /// Opens the store and points `target_dir` into it. The store is returned still locked.
 fn set_up_target_dir(
-    store_dir: Utf8PathBuf,
+    store_dir: &Utf8Path,
     workspace_dir: &Utf8Path,
     target_dir: &Utf8Path,
 ) -> Result<LockedStore> {
-    let store = LockedStore::open(store_dir.clone())?;
+    let store = open_store_outside_target_dir(store_dir, target_dir)?;
     match store.set_up_target_dir(workspace_dir, target_dir)? {
         TargetDirSetup::Done(store) => return Ok(store),
         // The store is unlocked here, so a slow removal doesn't block other targo runs.
         TargetDirSetup::DirectoryInTheWay => remove_target_dir(target_dir)?,
     }
 
-    let store = LockedStore::open(store_dir)?;
+    let store = open_store_outside_target_dir(store_dir, target_dir)?;
     match store.set_up_target_dir(workspace_dir, target_dir)? {
         TargetDirSetup::Done(store) => Ok(store),
         TargetDirSetup::DirectoryInTheWay => {
@@ -102,6 +103,64 @@ fn set_up_target_dir(
                  store: make sure nothing else is building in this workspace, then try again"
             );
         }
+    }
+}
+
+/// Opens the store after checking that it is outside the target dir.
+fn open_store_outside_target_dir(
+    store_dir: &Utf8Path,
+    target_dir: &Utf8Path,
+) -> Result<LockedStore> {
+    // Before the store is opened, because opening creates it.
+    ensure_store_outside_target_dir(store_dir, target_dir)?;
+    LockedStore::open(store_dir.to_owned())
+}
+
+/// Fails if the store would be at or inside the target dir, where it would be deleted.
+fn ensure_store_outside_target_dir(store_dir: &Utf8Path, target_dir: &Utf8Path) -> Result<()> {
+    let store_location = resolve_location(store_dir)
+        .wrap_err_with(|| format!("failed to resolve targo store directory `{store_dir}`"))?;
+
+    // The path itself, which setup replaces if a real directory is there.
+    let (Some(target_parent), Some(target_name)) = (target_dir.parent(), target_dir.file_name())
+    else {
+        bail!("target dir `{target_dir}` has no file name");
+    };
+    let replaced_location = resolve_location(target_parent)
+        .wrap_err_with(|| format!("failed to resolve target dir `{target_dir}`"))?
+        .join(target_name);
+    // Where the path leads if it is a symlink, which is where build output goes.
+    // Best effort: nothing is deleted through the link, so a broken one is not an error.
+    let linked_location = target_dir
+        .canonicalize()
+        .inspect_err(|err| {
+            tracing::debug!(
+                "target dir `{target_dir}` can't be resolved, so only the path itself is \
+                 checked: {err}"
+            );
+        })
+        .ok();
+
+    for target_location in iter::once(replaced_location).chain(linked_location) {
+        if store_location.starts_with(&target_location) {
+            bail!(
+                "targo store directory {} must be outside target dir {}, where it would be \
+                 deleted along with build output: set `{STORE_DIR_ENV}` to a directory \
+                 somewhere else",
+                display_with_location(store_dir, &store_location),
+                display_with_location(target_dir, &target_location),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Formats `path`, along with where it really is if that differs.
+fn display_with_location(path: &Utf8Path, location: &Path) -> String {
+    if location == path.as_std_path() {
+        format!("`{path}`")
+    } else {
+        format!("`{path}` (which resolves to `{}`)", location.display())
     }
 }
 
@@ -312,7 +371,10 @@ fn default_store_dir() -> Result<Utf8PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::ffi::OsStringExt;
+    use std::{
+        fs,
+        os::unix::{ffi::OsStringExt, fs::symlink},
+    };
 
     #[test]
     fn test_parse_wrap_cargo_args() {
@@ -445,6 +507,25 @@ mod tests {
             parse_store_dir_override(Some(non_utf8.clone())),
             Err(StoreDirEnvError::NotUtf8(non_utf8))
         );
+    }
+
+    #[test]
+    fn test_store_refused_inside_target_dir_of_symlinked_workspace() {
+        let temp_dir = camino_tempfile::tempdir().expect("created temp dir");
+        let root = temp_dir.path().canonicalize_utf8().expect("canonicalized");
+        fs::create_dir(root.join("workspace")).expect("created workspace dir");
+        symlink("workspace", root.join("alias")).expect("created symlink");
+
+        let error = ensure_store_outside_target_dir(
+            &root.join("workspace/target/store"),
+            &root.join("alias/target"),
+        )
+        .expect_err("the store is refused");
+        let expected = format!(
+            "must be outside target dir `{root}/alias/target` \
+             (which resolves to `{root}/workspace/target`)"
+        );
+        assert!(error.to_string().contains(&expected), "error was: {error}");
     }
 
     fn shell_args(input: &str) -> Vec<OsString> {

@@ -5,10 +5,12 @@ use color_eyre::{
     eyre::{bail, WrapErr},
     Result,
 };
-use lexopt::prelude::*;
 use std::{
+    error,
     ffi::{OsStr, OsString},
-    path::{Path, PathBuf},
+    fmt,
+    os::unix::ffi::OsStrExt,
+    path::PathBuf,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -46,8 +48,7 @@ impl TargoApp {
 }
 
 fn exec_wrap_cargo(args: Vec<OsString>) -> Result<()> {
-    let parser = lexopt::Parser::from_args(args);
-    let parsed_args = match WrapCargoArgs::new(parser)? {
+    let parsed_args = match WrapCargoArgs::new(args)? {
         WrapCargoArgs::Enabled {
             parsed_args,
             workspace_dir,
@@ -83,20 +84,15 @@ enum WrapCargoArgs {
 }
 
 impl WrapCargoArgs {
-    fn new(parser: lexopt::Parser) -> Result<Self> {
+    fn new(args: Vec<OsString>) -> Result<Self> {
         // TODO: intercept cargo clean -- it doesn't work right now, it should clean the symlink
         // target.
 
-        let parsed_args = ParsedCargoArgs::from_parser(parser)
-            .with_context(|| "error parsing Cargo arguments")?;
+        let parsed_args =
+            ParsedCargoArgs::new(args).with_context(|| "error parsing Cargo arguments")?;
 
         // Determine the workspace dir.
-        let mut locate_project = CargoCli::new();
-        locate_project.args(["locate-project", "--workspace", "--message-format=plain"]);
-        if let Some(manifest_path) = &parsed_args.manifest_path {
-            locate_project.arg("--manifest-path");
-            locate_project.arg(manifest_path);
-        }
+        let locate_project = parsed_args.locate_project_command();
 
         let output = match locate_project.stdout_output() {
             Ok(output) => output,
@@ -133,98 +129,89 @@ impl WrapCargoArgs {
 
 #[derive(Clone, Debug)]
 struct ParsedCargoArgs {
-    cli_args: Vec<OsString>,
-    post_double_hyphen: Vec<OsString>,
+    /// The arguments exactly as given, passed through to Cargo unchanged.
+    args: Vec<OsString>,
     manifest_path: Option<PathBuf>,
 }
 
 impl ParsedCargoArgs {
-    fn from_parser(mut parser: lexopt::Parser) -> Result<Self> {
-        let mut seen_double_hyphen = false;
-        let mut cli_args = Vec::new();
-        let mut post_double_hyphen = Vec::new();
-        let mut manifest_path = None;
-        while let Some(arg) = parser.next()? {
-            match arg {
-                Long("manifest-path") => {
-                    // manifest-path can't be specified multiple times
-                    let new_manifest_path = match &manifest_path {
-                        None => parser.value()?,
-                        Some(_) => {
-                            return Err(lexopt::Error::Custom(
-                                "error: The argument '--manifest-path <PATH>' was provided \
-                                 more than once, but cannot be used multiple times"
-                                    .into(),
-                            )
-                            .into());
-                        }
-                    };
-                    manifest_path = Some(PathBuf::from(new_manifest_path.clone()));
-                    tracing::debug!(
-                        "setting manifest-path to {}",
-                        Path::new(&new_manifest_path).display()
-                    );
-
-                    // Also pass through the manifest path to the underlying cargo command.
-                    cli_args.extend(["--manifest-path".into(), new_manifest_path]);
-                }
-                Long(other) => {
-                    let other = other.to_owned();
-                    if let Some(val) = parser.optional_value() {
-                        tracing::debug!("long arg: {other} with optional value: {val:?}");
-                        let mut arg = OsString::from(format!("--{other}="));
-                        arg.push(&val);
-                        cli_args.push(arg);
-                    } else {
-                        tracing::debug!("long arg: {other} without optional value");
-                        cli_args.push(format!("--{other}").into());
-                    }
-                }
-                Short(arg) => {
-                    if let Some(val) = parser.optional_value() {
-                        tracing::debug!("short arg: {arg} with optional value: {val:?}");
-                        let mut arg = OsString::from(format!("-{arg}="));
-                        arg.push(&val);
-                        cli_args.push(arg);
-                    } else {
-                        tracing::debug!("short arg: {arg} without optional value");
-                        cli_args.push(format!("-{arg}").into());
-                    }
-                }
-                Value(value) => {
-                    if seen_double_hyphen {
-                        tracing::debug!(
-                            "argument {value:?}, post-double-hyphen so treating literally"
-                        );
-                        post_double_hyphen.push(value);
-                    } else {
-                        tracing::debug!("argument {value:?}");
-                        cli_args.push(value);
-                    }
-                }
-            }
-            if parser.raw_args()?.peek() == Some(OsStr::new("--")) {
-                seen_double_hyphen = true;
-            }
-        }
-
+    fn new(args: Vec<OsString>) -> Result<Self, ManifestPathError> {
+        let manifest_path = find_manifest_path(&args)?.map(PathBuf::from);
+        tracing::debug!("manifest-path: {manifest_path:?}");
         Ok(Self {
-            cli_args,
-            post_double_hyphen,
+            args,
             manifest_path,
         })
     }
 
     fn cargo_command(&self) -> CargoCli {
         let mut cli = CargoCli::new();
-        cli.args(&self.cli_args);
-        if !self.post_double_hyphen.is_empty() {
-            cli.arg("--");
-            cli.args(&self.post_double_hyphen);
+        cli.args(&self.args);
+        cli
+    }
+
+    fn locate_project_command(&self) -> CargoCli {
+        let mut cli = CargoCli::new();
+        cli.args(["locate-project", "--workspace", "--message-format=plain"]);
+        if let Some(manifest_path) = &self.manifest_path {
+            // Cargo only accepts a path starting with `-` in the `=` form.
+            let mut arg = OsString::from("--manifest-path=");
+            arg.push(manifest_path);
+            cli.arg(arg);
         }
         cli
     }
 }
+
+/// Finds the value of `--manifest-path` among arguments meant for Cargo.
+///
+/// Targo doesn't know which of Cargo's options take values, so no other argument is parsed.
+fn find_manifest_path(args: &[OsString]) -> Result<Option<&OsStr>, ManifestPathError> {
+    let mut manifest_path = None;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            // The rest is for whatever Cargo runs, not for Cargo.
+            break;
+        }
+        let value = if arg == "--manifest-path" {
+            // Cargo itself rejects an option-like value, so take whatever is next.
+            args.next()
+                .ok_or(ManifestPathError::MissingValue)?
+                .as_os_str()
+        } else if let Some(value) = arg.as_bytes().strip_prefix(b"--manifest-path=") {
+            OsStr::from_bytes(value)
+        } else {
+            continue;
+        };
+        if manifest_path.replace(value).is_some() {
+            return Err(ManifestPathError::Duplicate);
+        }
+    }
+    Ok(manifest_path)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManifestPathError {
+    MissingValue,
+    Duplicate,
+}
+
+impl fmt::Display for ManifestPathError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingValue => f.write_str(
+                "a value is required for `--manifest-path <PATH>`, but none was supplied",
+            ),
+            Self::Duplicate => f.write_str(
+                "the argument `--manifest-path <PATH>` was provided more than once, \
+                 but cannot be used multiple times",
+            ),
+        }
+    }
+}
+
+impl error::Error for ManifestPathError {}
 
 fn find_targo_store_dir() -> Result<Utf8PathBuf> {
     let dir = home::cargo_home().wrap_err("unable to determine cargo home dir")?;
@@ -239,32 +226,133 @@ fn find_targo_store_dir() -> Result<Utf8PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStringExt;
 
     #[test]
-    fn test_parse_wrap_cargo_args() -> Result<()> {
-        let data = [
-            "build -p foo",
-            "build -p=foo",
-            "test",
-            "clippy --package baz --manifest-path test",
-            "clippy --package=baz",
-            "check --all-targets -- -Dwarnings",
-            "run --package baz -- -- arg1 arg2",
+    fn test_parse_wrap_cargo_args() {
+        let data: &[(&str, Result<Option<&str>, ManifestPathError>)] = &[
+            ("", Ok(None)),
+            ("-vv version", Ok(None)),
+            ("build -pfoo -j8", Ok(None)),
+            ("build --foo= - ''", Ok(None)),
+            ("run --", Ok(None)),
+            ("-- version", Ok(None)),
+            (
+                "clippy --package baz --manifest-path test",
+                Ok(Some("test")),
+            ),
+            (
+                "build --manifest-path=a/Cargo.toml -v",
+                Ok(Some("a/Cargo.toml")),
+            ),
+            ("build --manifest-path=a=b", Ok(Some("a=b"))),
+            ("build --manifest-path=", Ok(Some(""))),
+            ("build --manifest-path -- a", Ok(Some("--"))),
+            (
+                "build --manifest-path --manifest-path=a",
+                Ok(Some("--manifest-path=a")),
+            ),
+            ("--manifest-path a run -- --manifest-path b", Ok(Some("a"))),
+            ("build --manifest-paths a --manifest a", Ok(None)),
+            (
+                "build --manifest-path",
+                Err(ManifestPathError::MissingValue),
+            ),
+            (
+                "build --manifest-path=a --manifest-path a",
+                Err(ManifestPathError::Duplicate),
+            ),
         ];
-        for input in data {
-            let input_args = shell_words::split(input)?;
-            let parser = lexopt::Parser::from_args(input_args.clone());
-            let args = ParsedCargoArgs::from_parser(parser)?;
-
-            let cargo_command = args.cargo_command();
-            let output: Vec<_> = cargo_command
-                .get_args()
-                .iter()
-                .map(|s| s.to_str().expect("inputs were valid strings").to_owned())
-                .collect();
-            assert_eq!(input_args, output, "input matches output");
+        for (input, expected) in data {
+            assert_parsed(
+                shell_args(input),
+                expected.map(|path| path.map(PathBuf::from)),
+            );
         }
+    }
 
-        Ok(())
+    #[test]
+    fn test_parse_wrap_cargo_args_non_utf8() {
+        assert_parsed_bytes(
+            &[b"build", b"-\xff\xfe", b"--f\xffoo", b"--f\xffoo=b\xffar"],
+            None,
+        );
+        assert_parsed_bytes(&[b"build", b"--manifest-path", b"a\xff"], Some(b"a\xff"));
+        assert_parsed_bytes(&[b"build", b"--manifest-path=\xff=a"], Some(b"\xff=a"));
+    }
+
+    fn assert_parsed_bytes(input: &[&[u8]], expected: Option<&[u8]>) {
+        let args = input.iter().map(|arg| os_string(arg)).collect();
+        assert_parsed(
+            args,
+            Ok(expected.map(|path| PathBuf::from(os_string(path)))),
+        );
+    }
+
+    #[test]
+    fn test_locate_project_command() {
+        let data = [
+            ("build", "locate-project --workspace --message-format=plain"),
+            (
+                "build --manifest-path=-x/Cargo.toml",
+                "locate-project --workspace --message-format=plain --manifest-path=-x/Cargo.toml",
+            ),
+        ];
+        for (input, expected) in data {
+            let parsed = ParsedCargoArgs::new(shell_args(input)).expect("input is valid");
+            assert_eq!(
+                parsed.locate_project_command().get_args(),
+                shell_args(expected),
+                "for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_wrap_cargo_args_from_clap() {
+        // A leading `--` is not covered: clap drops it.
+        let data = [
+            "",
+            "-vv version",
+            "--help",
+            "--version",
+            "run -- -- arg1 --",
+        ];
+        let inputs = data
+            .into_iter()
+            .map(shell_args)
+            .chain([vec![os_string(b"-\xff"), os_string(b"--f\xffoo=\xff")]]);
+        for input in inputs {
+            let app_args = ["targo", "wrap-cargo"]
+                .into_iter()
+                .map(OsString::from)
+                .chain(input.iter().cloned());
+            let app = TargoApp::try_parse_from(app_args)
+                .unwrap_or_else(|error| panic!("for {input:?}, clap failed: {error}"));
+            let TargoCommand::WrapCargo { args } = app.command;
+            assert_eq!(args, input, "clap passes arguments through unchanged");
+        }
+    }
+
+    fn shell_args(input: &str) -> Vec<OsString> {
+        shell_words::split(input)
+            .expect("input is valid shell syntax")
+            .into_iter()
+            .map(OsString::from)
+            .collect()
+    }
+
+    fn os_string(bytes: &[u8]) -> OsString {
+        OsString::from_vec(bytes.to_vec())
+    }
+
+    /// Checks the manifest path found in `input`, and that Cargo is given exactly `input`.
+    fn assert_parsed(input: Vec<OsString>, expected: Result<Option<PathBuf>, ManifestPathError>) {
+        let actual = ParsedCargoArgs::new(input.clone()).map(|parsed| {
+            let cargo_args = parsed.cargo_command().get_args().to_vec();
+            (parsed.manifest_path, cargo_args)
+        });
+        let expected = expected.map(|manifest_path| (manifest_path, input.clone()));
+        assert_eq!(actual, expected, "for {input:?}");
     }
 }

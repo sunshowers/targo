@@ -4,8 +4,11 @@ use crate::{
 };
 use camino::{Utf8Path, Utf8PathBuf};
 use cap_std::{ambient_authority, fs_utf8::Dir};
-use color_eyre::{eyre::Context, Result};
-use std::{fs, io};
+use color_eyre::{
+    eyre::{bail, Context},
+    Report, Result,
+};
+use std::{ffi::OsString, fmt, fs, io};
 use xxhash_rust::xxh3::xxh3_64;
 
 /// The targo store, with `targo.lock` held exclusively for as long as this value exists.
@@ -35,7 +38,7 @@ impl LockedStore {
         let store = Self { store_dir, lock };
 
         // Does the directory already have Targo metadata stored in it?
-        let metadata = store.read_store_metadata()?;
+        let metadata = read_store_metadata(&store.store_dir)?;
 
         let metadata_to_write = match &metadata {
             Some(metadata) => metadata.upgrade_if_necessary(),
@@ -120,18 +123,6 @@ impl LockedStore {
     // Helper methods
     // ---
 
-    fn read_store_metadata(&self) -> Result<Option<TargoStoreMetadata>> {
-        let metadata: Option<TargoStoreMetadata> = self
-            .store_dir
-            .read_metadata(TargoStoreMetadata::METADATA_FILE_NAME)?;
-        let metadata = if let Some(metadata) = metadata {
-            Some(metadata.verify(self.store_dir.path())?)
-        } else {
-            None
-        };
-        Ok(metadata)
-    }
-
     fn write_store_metadata(&self, metadata: &TargoStoreMetadata) -> Result<()> {
         self.store_dir
             .write_metadata(TargoStoreMetadata::METADATA_FILE_NAME, metadata)
@@ -152,6 +143,203 @@ impl LockedStore {
                 )
             },
         )
+    }
+}
+
+/// Reads the store metadata, which must not be from a newer version of targo.
+fn read_store_metadata(store_dir: &DirWithPath) -> Result<Option<TargoStoreMetadata>> {
+    let metadata: Option<TargoStoreMetadata> =
+        store_dir.read_metadata(TargoStoreMetadata::METADATA_FILE_NAME)?;
+    let metadata = if let Some(metadata) = metadata {
+        Some(metadata.verify(store_dir.path())?)
+    } else {
+        None
+    };
+    Ok(metadata)
+}
+
+/// A targo store that already exists, opened without taking `targo.lock`.
+///
+/// Nothing is written through it, and what it reads can change at any time.
+#[derive(Debug)]
+pub(crate) struct UnlockedStore {
+    store_dir: DirWithPath,
+}
+
+impl UnlockedStore {
+    /// Opens the store at `store_dir_path`. Returns `None` if no directory is there.
+    pub(crate) fn open(store_dir_path: Utf8PathBuf) -> Result<Option<Self>> {
+        let store_dir = match Dir::open_ambient_dir(&store_dir_path, ambient_authority()) {
+            Ok(store_dir) => store_dir,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(err).wrap_err_with(|| {
+                    format!("failed to open targo store directory `{store_dir_path}`")
+                })
+            }
+        };
+        let store_dir = DirWithPath::new(store_dir, store_dir_path);
+
+        let Some(metadata) = read_store_metadata(&store_dir)? else {
+            bail!(
+                "`{}` is not a targo store: it has no `{}`, which `targo wrap-cargo` writes \
+                 when it creates a store",
+                store_dir.path(),
+                TargoStoreMetadata::METADATA_FILE_NAME,
+            );
+        };
+        // Upgrading is a write, and the layout of an older store may differ.
+        if metadata.upgrade_if_necessary().is_some() {
+            bail!(
+                "targo store directory at `{}` is from an older version of targo: \
+                 run any Cargo command through `targo wrap-cargo` to upgrade it",
+                store_dir.path(),
+            );
+        }
+
+        Ok(Some(Self { store_dir }))
+    }
+
+    /// Lists every directory at the top level of the store, sorted by name.
+    pub(crate) fn entries(&self) -> Result<Vec<StoreEntry>> {
+        let read_error = || {
+            format!(
+                "failed to read targo store directory `{}`",
+                self.store_dir.path()
+            )
+        };
+
+        let mut dir_names = Vec::new();
+        // Read as OS strings: a name that isn't UTF-8 is still reported.
+        let dir_entries = self.store_dir.dir().as_cap_std().entries();
+        for dir_entry in dir_entries.wrap_err_with(read_error)? {
+            let dir_entry = dir_entry.wrap_err_with(read_error)?;
+            let name = dir_entry.file_name();
+            // Not entries: writing the store metadata makes a temp dir with such a name.
+            if name.as_encoded_bytes().starts_with(b".") {
+                continue;
+            }
+            // Not `file_type()`, which is unknown on a filesystem that doesn't report types.
+            let metadata = match dir_entry.metadata() {
+                Ok(metadata) => metadata,
+                // Removed since it was listed.
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err).wrap_err_with(read_error),
+            };
+            // Not followed, so a symlink is not an entry either.
+            if metadata.is_dir() {
+                dir_names.push(name);
+            }
+        }
+        dir_names.sort();
+
+        Ok(dir_names
+            .into_iter()
+            .map(|name| self.read_entry(name))
+            .collect())
+    }
+
+    /// The directory of the entry `name`.
+    pub(crate) fn entry_path(&self, name: &EntryName) -> Utf8PathBuf {
+        self.store_dir.path().join(&name.0)
+    }
+
+    /// The directory that backlinks to the entry `name` point at.
+    pub(crate) fn entry_target_path(&self, name: &EntryName) -> Utf8PathBuf {
+        self.entry_path(name).join("target")
+    }
+
+    pub(crate) fn open_entry_dir(&self, name: &EntryName) -> io::Result<DirWithPath> {
+        let entry_dir = self.store_dir.dir().open_dir(&name.0)?;
+        Ok(DirWithPath::new(entry_dir, self.entry_path(name)))
+    }
+
+    fn read_entry(&self, name: OsString) -> StoreEntry {
+        let name = match name.into_string() {
+            Ok(name) => EntryName(name),
+            Err(name) => {
+                return StoreEntry::Unrecognized(UnrecognizedDir {
+                    name,
+                    reason: UnrecognizedReason::NameNotUtf8,
+                })
+            }
+        };
+        match self.read_entry_metadata(&name) {
+            Ok(metadata) => StoreEntry::Recognized { name, metadata },
+            Err(reason) => StoreEntry::Unrecognized(UnrecognizedDir {
+                name: name.0.into(),
+                reason,
+            }),
+        }
+    }
+
+    fn read_entry_metadata(
+        &self,
+        name: &EntryName,
+    ) -> Result<TargetDirMetadata, UnrecognizedReason> {
+        let entry_dir = self
+            .open_entry_dir(name)
+            .wrap_err_with(|| format!("failed to open `{}`", self.entry_path(name)))
+            .map_err(UnrecognizedReason::Unreadable)?;
+        match entry_dir.read_metadata(TargetDirMetadata::METADATA_FILE_NAME) {
+            Ok(Some(metadata)) => Ok(metadata),
+            Ok(None) => Err(UnrecognizedReason::NoMetadata),
+            Err(error) => Err(UnrecognizedReason::Unreadable(error)),
+        }
+    }
+}
+
+/// The name of an entry's directory in the store, which is an encoded workspace path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EntryName(String);
+
+impl EntryName {
+    #[cfg(test)]
+    pub(crate) fn new(name: &str) -> Self {
+        Self(name.to_owned())
+    }
+}
+
+impl fmt::Display for EntryName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A directory at the top level of the store.
+#[derive(Debug)]
+pub(crate) enum StoreEntry {
+    Recognized {
+        name: EntryName,
+        metadata: TargetDirMetadata,
+    },
+    Unrecognized(UnrecognizedDir),
+}
+
+/// A directory in the store that targo can't identify as an entry, and so leaves alone.
+#[derive(Debug)]
+pub(crate) struct UnrecognizedDir {
+    /// Only for display: it might not be UTF-8.
+    pub(crate) name: OsString,
+    pub(crate) reason: UnrecognizedReason,
+}
+
+#[derive(Debug)]
+pub(crate) enum UnrecognizedReason {
+    NameNotUtf8,
+    NoMetadata,
+    /// The directory or its metadata could not be read or parsed.
+    Unreadable(Report),
+}
+
+impl fmt::Display for UnrecognizedReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NameNotUtf8 => f.write_str("its name is not valid UTF-8"),
+            Self::NoMetadata => write!(f, "it has no `{}`", TargetDirMetadata::METADATA_FILE_NAME),
+            // The alternate form puts the whole chain of causes on one line.
+            Self::Unreadable(error) => write!(f, "{error:#}"),
+        }
     }
 }
 
@@ -346,6 +534,7 @@ fn truncate_with_hash(encoded: String) -> String {
 mod tests {
     use super::*;
     use fs2::FileExt;
+    use std::os::unix::{ffi::OsStringExt, fs::symlink};
 
     /// A temp dir with paths for a store and a workspace's target dir.
     struct TestDirs {
@@ -359,9 +548,10 @@ mod tests {
     impl TestDirs {
         fn new() -> Self {
             let temp_dir = camino_tempfile::tempdir().expect("created temp dir");
-            let root = temp_dir.path();
+            // Nested, so that a path that escapes upwards by mistake stays in the temp dir.
+            let root = temp_dir.path().join("a/b/c");
             let workspace_dir = root.join("workspace");
-            fs::create_dir(&workspace_dir).expect("created workspace dir");
+            fs::create_dir_all(&workspace_dir).expect("created workspace dir");
             Self {
                 store_dir: root.join("store"),
                 target_dir: workspace_dir.join("target"),
@@ -446,6 +636,80 @@ mod tests {
         fs::write(&dirs.target_dir, "").expect("wrote file");
         remove_target_dir(&dirs.target_dir).expect("a file is left for the caller to look at");
         assert!(dirs.target_dir.is_file());
+    }
+
+    #[test]
+    fn test_unlocked_store_entries() {
+        let dirs = TestDirs::new();
+        match dirs.set_up_target_dir(dirs.open_store()) {
+            TargetDirSetup::Done(store) => store.unlock().expect("unlocked store"),
+            TargetDirSetup::DirectoryInTheWay => panic!("found a real directory"),
+        }
+        let entry_name = encode_workspace_path(&dirs.workspace_dir);
+
+        // None of these is an entry.
+        fs::create_dir(dirs.store_dir.join(".dot-dir")).expect("created dir");
+        fs::write(dirs.store_dir.join("file"), "").expect("wrote file");
+        symlink(&entry_name, dirs.store_dir.join("link-to-entry")).expect("created symlink");
+        // These are directories that targo didn't create.
+        fs::create_dir(dirs.store_dir.join("no-metadata")).expect("created dir");
+        let non_utf8_name = OsString::from_vec(b"\xffnot-utf8".to_vec());
+        let non_utf8_names = match fs::create_dir(dirs.store_dir.as_std_path().join(&non_utf8_name))
+        {
+            Ok(()) => vec![(non_utf8_name, "name not UTF-8")],
+            Err(error) => {
+                eprintln!("skipped: the filesystem refuses a name that is not UTF-8: {error}");
+                vec![]
+            }
+        };
+
+        let store = UnlockedStore::open(dirs.store_dir.clone())
+            .expect("opened store")
+            .expect("the store exists");
+        let entries = store.entries().expect("listed entries");
+        dirs.lock_probe()
+            .try_lock_exclusive()
+            .expect("the store lock is not taken to list entries");
+
+        let actual: Vec<_> = entries
+            .iter()
+            .map(|entry| match entry {
+                StoreEntry::Recognized { name, metadata } => {
+                    let backlinks: Vec<_> = metadata.backlinks.iter().collect();
+                    assert_eq!(backlinks, [&dirs.target_dir]);
+                    (OsString::from(name.to_string()), "recognized")
+                }
+                StoreEntry::Unrecognized(dir) => {
+                    let reason = match &dir.reason {
+                        UnrecognizedReason::NameNotUtf8 => "name not UTF-8",
+                        UnrecognizedReason::NoMetadata => "no metadata",
+                        UnrecognizedReason::Unreadable(_) => "unreadable",
+                    };
+                    (dir.name.clone(), reason)
+                }
+            })
+            .collect();
+        let mut expected = vec![
+            (OsString::from(entry_name), "recognized"),
+            (OsString::from("no-metadata"), "no metadata"),
+        ];
+        expected.extend(non_utf8_names);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_unlocked_store_open_creates_nothing() {
+        let dirs = TestDirs::new();
+        let store = UnlockedStore::open(dirs.store_dir.clone()).expect("looked for the store");
+        assert!(store.is_none(), "there is no store");
+        assert!(dirs.store_dir.symlink_metadata().is_err());
+
+        fs::write(&dirs.store_dir, "").expect("wrote file");
+        let error = UnlockedStore::open(dirs.store_dir.clone()).expect_err("a file is no store");
+        assert_eq!(
+            error.to_string(),
+            format!("failed to open targo store directory `{}`", dirs.store_dir)
+        );
     }
 
     // A shared probe is contended only by an exclusive lock.

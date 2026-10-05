@@ -1,9 +1,11 @@
 use crate::{
     cargo_cli::{CargoCli, CargoOutput},
+    gc::{self, GcPolicy},
     helpers::resolve_location,
     store::{remove_target_dir, LockedStore, TargetDirSetup},
 };
 use camino::{Utf8Path, Utf8PathBuf};
+use chrono::Utc;
 use clap::{Parser, Subcommand, ValueHint};
 use color_eyre::{
     eyre::{bail, WrapErr},
@@ -12,10 +14,11 @@ use color_eyre::{
 use std::{
     error,
     ffi::{OsStr, OsString},
-    fmt, iter,
+    fmt, io, iter,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     process::ExitStatus,
+    time::Duration,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -40,6 +43,21 @@ pub enum TargoCommand {
         )]
         args: Vec<OsString>,
     },
+    /// Report the store entries that no workspace links to any more.
+    Gc {
+        /// Report what would be removed, and change nothing (required: gc can't remove yet).
+        #[arg(long, required = true)]
+        dry_run: bool,
+
+        /// How long an entry is kept after it was last used, once no workspace links to it.
+        #[arg(
+            long,
+            value_name = "DURATION",
+            default_value = "1d",
+            value_parser = humantime::parse_duration,
+        )]
+        orphan_grace: Duration,
+    },
 }
 
 impl TargoApp {
@@ -48,13 +66,18 @@ impl TargoApp {
         tracing_subscriber::fmt().with_env_filter(filter).init();
         match self.command {
             TargoCommand::WrapCargo { args } => exec_wrap_cargo(args),
+            // clap requires `--dry-run`, so the flag itself says nothing.
+            TargoCommand::Gc {
+                dry_run: _,
+                orphan_grace,
+            } => exec_gc(GcPolicy { orphan_grace }),
         }
     }
 }
 
 fn exec_wrap_cargo(args: Vec<OsString>) -> Result<()> {
     // Checked first so that a bad override fails even when targo is disabled.
-    let store_dir_override = parse_store_dir_override(std::env::var_os(STORE_DIR_ENV))?;
+    let store_dir_override = store_dir_override_from_env()?;
 
     let parsed_args = match WrapCargoArgs::new(args)? {
         WrapCargoArgs::Enabled {
@@ -63,10 +86,7 @@ fn exec_wrap_cargo(args: Vec<OsString>) -> Result<()> {
             target_dir,
         } => {
             // Find the target directory destination.
-            let store_dir = match store_dir_override {
-                Some(store_dir) => store_dir,
-                None => default_store_dir()?,
-            };
+            let store_dir = choose_store_dir(store_dir_override)?;
             let store = set_up_target_dir(&store_dir, &workspace_dir, &target_dir)?;
 
             // Cargo must not run under the store lock: a build can take a long time.
@@ -86,6 +106,11 @@ fn exec_wrap_cargo(args: Vec<OsString>) -> Result<()> {
     parsed_args.cargo_command().run_or_exec()?;
 
     Ok(())
+}
+
+fn exec_gc(policy: GcPolicy) -> Result<()> {
+    let store_dir = choose_store_dir(store_dir_override_from_env()?)?;
+    gc::dry_run(store_dir, &policy, Utc::now(), &mut io::stdout().lock())
 }
 
 /// Opens the store and points `target_dir` into it. The store is returned still locked.
@@ -380,6 +405,18 @@ impl error::Error for ManifestPathError {}
 /// The environment variable that overrides the store directory.
 const STORE_DIR_ENV: &str = "TARGO_STORE_DIR";
 
+fn store_dir_override_from_env() -> Result<Option<Utf8PathBuf>, StoreDirEnvError> {
+    parse_store_dir_override(std::env::var_os(STORE_DIR_ENV))
+}
+
+/// The store directory: the override if there is one, otherwise `$CARGO_HOME/targo`.
+fn choose_store_dir(store_dir_override: Option<Utf8PathBuf>) -> Result<Utf8PathBuf> {
+    match store_dir_override {
+        Some(store_dir) => Ok(store_dir),
+        None => default_store_dir(),
+    }
+}
+
 /// Returns the store directory named by the value of `TARGO_STORE_DIR`, if the variable is set.
 fn parse_store_dir_override(
     value: Option<OsString>,
@@ -442,6 +479,7 @@ fn default_store_dir() -> Result<Utf8PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::error::ErrorKind;
     use std::{
         fs,
         os::unix::{ffi::OsStringExt, fs::symlink},
@@ -585,8 +623,47 @@ mod tests {
                 .chain(input.iter().cloned());
             let app = TargoApp::try_parse_from(app_args)
                 .unwrap_or_else(|error| panic!("for {input:?}, clap failed: {error}"));
-            let TargoCommand::WrapCargo { args } = app.command;
-            assert_eq!(args, input, "clap passes arguments through unchanged");
+            match app.command {
+                TargoCommand::WrapCargo { args } => {
+                    assert_eq!(args, input, "clap passes arguments through unchanged");
+                }
+                TargoCommand::Gc { .. } => panic!("for {input:?}, clap parsed a gc command"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_gc_args_from_clap() {
+        let parse = |input: &str| {
+            let app_args = ["targo", "gc"].into_iter().map(OsString::from);
+            TargoApp::try_parse_from(app_args.chain(shell_args(input)))
+        };
+
+        let data = [
+            ("--dry-run", Duration::from_secs(24 * 60 * 60)),
+            ("--orphan-grace 90m --dry-run", Duration::from_secs(90 * 60)),
+            ("--dry-run --orphan-grace=0s", Duration::ZERO),
+        ];
+        for (input, expected) in data {
+            let app = parse(input).unwrap_or_else(|error| panic!("for {input:?}: {error}"));
+            match app.command {
+                TargoCommand::Gc { orphan_grace, .. } => {
+                    assert_eq!(orphan_grace, expected, "for {input:?}");
+                }
+                TargoCommand::WrapCargo { .. } => panic!("for {input:?}, clap parsed wrap-cargo"),
+            }
+        }
+
+        let error_data = [
+            ("", ErrorKind::MissingRequiredArgument),
+            ("--orphan-grace 1d", ErrorKind::MissingRequiredArgument),
+            ("--dry-run --orphan-grace soon", ErrorKind::ValueValidation),
+            // A number needs a unit.
+            ("--dry-run --orphan-grace 1", ErrorKind::ValueValidation),
+        ];
+        for (input, expected) in error_data {
+            let error = parse(input).expect_err("clap rejects the arguments");
+            assert_eq!(error.kind(), expected, "for {input:?}: {error}");
         }
     }
 

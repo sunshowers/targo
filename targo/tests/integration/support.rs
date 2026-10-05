@@ -39,6 +39,9 @@ impl TestEnv {
             .path()
             .canonicalize_utf8()
             .expect("canonicalized temp dir");
+        // Nested, so that a path that escapes upwards by mistake stays in the temp dir.
+        let root = root.join("a/b/c");
+        fs::create_dir_all(&root).expect("created root");
         // Commands run in the root by default, where Cargo must not find a workspace.
         for dir in root.ancestors() {
             assert!(
@@ -52,7 +55,7 @@ impl TestEnv {
         }
     }
 
-    /// The root of the temp dir, which is not itself a workspace.
+    /// The directory that everything is created in, which is not itself a workspace.
     pub(crate) fn root(&self) -> &Utf8Path {
         &self.root
     }

@@ -6,6 +6,7 @@ use std::{
     io::{self, Write},
     os::unix::fs::{symlink, MetadataExt},
     process::Output,
+    time::SystemTime,
 };
 
 const HOUR: i64 = 60 * 60;
@@ -38,8 +39,19 @@ fn gc_dry_run_reports_and_changes_nothing() {
     create_symlink(&live_target, &relinked_link);
     fs::create_dir_all(&replaced_link).expect("created dir");
 
+    // The builds are newer than the last use, at either depth, so they give the age.
+    let built = store.create_entry("built-long-ago", &[&gone_link], -(60 * DAY + 12 * HOUR));
+    store.create_build_dir(&built, "target/debug", -(30 * DAY + 12 * HOUR));
+    store.create_build_dir(
+        &built,
+        "target/x86_64-unknown-linux-gnu/release",
+        -(20 * DAY + 12 * HOUR),
+    );
+
     store.create_entry("no-backlinks", &[], -(2 * DAY + 12 * HOUR));
     store.create_entry("recent-orphan", &[&gone_link], -HOUR);
+    let recently_built = store.create_entry("recently-built", &[&gone_link], -400 * DAY);
+    store.create_build_dir(&recently_built, "target/debug", -(HOUR + HOUR / 2));
     store.create_entry("future", &[&gone_link], 2 * DAY + 12 * HOUR);
 
     let looping_link = workspaces.join("looping/target");
@@ -74,14 +86,17 @@ fn gc_dry_run_reports_and_changes_nothing() {
     )
     .expect("copied file");
 
-    let (stale_size, orphan_size, no_backlinks_size) = (
+    let (stale_size, built_size, orphan_size, no_backlinks_size) = (
         disk_usage(&stale),
+        disk_usage(&built),
         disk_usage(&orphan),
         disk_usage(&store.dir.join("no-backlinks")),
     );
     let expected = format!(
         "would remove `stale` ({}): orphaned, last used 40d ago; \
          backlinks: `{relinked_link}` (points elsewhere), `{replaced_link}` (not a symlink)\n\
+         would remove `built-long-ago` ({}): orphaned, last built 20d ago; \
+         backlinks: `{gone_link}` (missing)\n\
          would remove `orphan` ({}): orphaned, last used 3d ago; \
          backlinks: `{gone_link}` (missing)\n\
          would remove `no-backlinks` ({}): orphaned, last used 2d ago; no backlinks\n\
@@ -91,14 +106,17 @@ fn gc_dry_run_reports_and_changes_nothing() {
          would keep `future`: last used 2d in the future; backlinks: `{gone_link}` (missing)\n\
          would keep `other-view`: backlink state unknown; backlinks: `{other_view_link}` \
          (unknown: the link names this entry by a path that does not resolve here)\n\
+         would keep `recently-built`: orphaned, last built 1h ago; \
+         backlinks: `{gone_link}` (missing)\n\
          would keep `unknown`: backlink state unknown; \
          backlinks: `{gone_link}` (missing), `{looping_link}` (unknown: {loop_error})\n\
-         would remove 3 entries ({}) and keep 7 entries: 1 live, 1 orphaned within grace, \
-         2 with unknown backlinks, 2 unrecognized, 1 last used in the future\n",
+         would remove 4 entries ({}) and keep 8 entries: 1 live, 2 orphaned within grace, \
+         2 with unknown backlinks, 2 unrecognized, 1 last active in the future\n",
         human_size(stale_size),
+        human_size(built_size),
         human_size(orphan_size),
         human_size(no_backlinks_size),
-        human_size(stale_size + orphan_size + no_backlinks_size),
+        human_size(stale_size + built_size + orphan_size + no_backlinks_size),
     );
 
     let before = env.snapshot();
@@ -350,6 +368,17 @@ impl TestStore {
         }
     }
 
+    /// Creates a build directory in an entry, last built in `built_secs` after the store was
+    /// created.
+    fn create_build_dir(&self, entry_dir: &Utf8Path, build_dir: &str, built_secs: i64) {
+        create_cargo_lock(entry_dir, build_dir);
+        let deps = entry_dir.join(build_dir).join("deps");
+        fs::create_dir(&deps).expect("created deps dir");
+        let built = SystemTime::from(self.now + TimeDelta::seconds(built_secs));
+        let deps = fs::File::open(&deps).expect("opened deps dir");
+        deps.set_modified(built).expect("set modification time");
+    }
+
     /// Creates an entry last used `last_used_secs` after the store was created.
     ///
     /// Half a unit away from a whole one, the age shown can't depend on how long the test takes.
@@ -386,6 +415,13 @@ fn write_synced(path: &Utf8Path, contents: &[u8]) {
 fn create_symlink(dest: &Utf8Path, link: &Utf8Path) {
     fs::create_dir_all(link.parent().expect("link has a parent")).expect("created dir");
     symlink(dest, link).expect("created symlink");
+}
+
+/// Creates a `.cargo-lock` in the build directory `build_dir` of an entry.
+fn create_cargo_lock(entry_dir: &Utf8Path, build_dir: &str) {
+    let lock_path = entry_dir.join(build_dir).join(".cargo-lock");
+    fs::create_dir_all(entry_dir.join(build_dir)).expect("created build dir");
+    write_synced(&lock_path, b"");
 }
 
 fn run_gc(env: &TestEnv, args: &[&str]) -> Output {

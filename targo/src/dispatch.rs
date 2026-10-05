@@ -49,7 +49,8 @@ pub enum TargoCommand {
         #[arg(long, required = true)]
         dry_run: bool,
 
-        /// How long an entry is kept after it was last used, once no workspace links to it.
+        /// How long an entry is kept after it was last used or built in, once no workspace
+        /// links to it.
         #[arg(
             long,
             value_name = "DURATION",

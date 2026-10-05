@@ -7,6 +7,7 @@ use cap_std::fs::{Dir, Metadata, MetadataExt as _};
 use chrono::{DateTime, Utc};
 use color_eyre::{eyre::WrapErr, Result};
 use std::{
+    cmp::Reverse,
     collections::HashSet,
     fmt, fs,
     io::{self, Write},
@@ -18,7 +19,7 @@ use std::{
 /// When gc collects an entry.
 #[derive(Debug)]
 pub(crate) struct GcPolicy {
-    /// How long an orphaned entry is kept after it was last used.
+    /// How long an orphaned entry is kept after its last activity.
     pub(crate) orphan_grace: Duration,
 }
 
@@ -42,9 +43,14 @@ pub(crate) fn dry_run(
     for entry in store.entries()? {
         match entry {
             StoreEntry::Recognized { name, metadata } => {
-                let entry = classify(&store, name, metadata);
+                let build_activity = BuildActivity::read(&store, &name);
+                let entry = classify(&store, name, metadata, build_activity);
                 match decide(&entry, now, policy) {
-                    Decision::RemoveOrphan { idle } => removals.push((entry, idle)),
+                    Decision::RemoveOrphan { idle, signal } => removals.push(Removal {
+                        entry,
+                        idle,
+                        signal,
+                    }),
                     Decision::Keep(reason) => {
                         kept_counts.add(reason);
                         kept_lines.extend(kept_line(&entry, reason));
@@ -57,8 +63,8 @@ pub(crate) fn dry_run(
             }
         }
     }
-    // Oldest first. The sort is stable, so entries used at the same time stay in name order.
-    removals.sort_by_key(|(entry, _)| entry.last_used);
+    // Oldest first. The sort is stable, so entries that are as old stay in name order.
+    removals.sort_by_key(|removal| Reverse(removal.idle));
 
     report_result(write_report(
         &store,
@@ -71,16 +77,16 @@ pub(crate) fn dry_run(
 
 fn write_report(
     store: &UnlockedStore,
-    removals: &[(RecognizedEntry, Duration)],
+    removals: &[Removal],
     kept_lines: &[String],
     kept_counts: &KeptCounts,
     out: &mut dyn Write,
 ) -> io::Result<()> {
     let mut total_size = ReportedSize::default();
-    for (entry, idle) in removals {
+    for removal in removals {
         // Slow, so each line is written as soon as its entry is measured.
-        let usage = measure_entry(store, &entry.name);
-        writeln!(out, "{}", removal_line(entry, *idle, &usage))?;
+        let usage = measure_entry(store, &removal.entry.name);
+        writeln!(out, "{}", removal_line(removal, &usage))?;
         total_size.add(&usage);
     }
     for line in kept_lines {
@@ -99,6 +105,14 @@ fn report_result(result: io::Result<()>) -> Result<()> {
         Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
         result => result.wrap_err("failed to write the gc report"),
     }
+}
+
+/// An orphaned entry that is to be removed, with how long ago `signal` says it was active.
+#[derive(Debug)]
+struct Removal {
+    entry: RecognizedEntry,
+    idle: Duration,
+    signal: ActivitySignal,
 }
 
 /// What is at the path of a backlink now.
@@ -246,11 +260,169 @@ impl Liveness {
     }
 }
 
-/// An entry with readable metadata, and the state of each of its backlinks.
+/// The lock file that Cargo holds while it builds in a directory.
+const CARGO_LOCK_NAME: &str = ".cargo-lock";
+
+/// A directory that Cargo builds in, which is one with a `.cargo-lock` in it.
+#[derive(Debug)]
+struct BuildDir {
+    dir: Dir,
+    path: PathBuf,
+}
+
+impl BuildDir {
+    /// Returns `None` if `dir` has no `.cargo-lock`.
+    fn new(dir: Dir, path: PathBuf) -> Result<Option<Self>, PathError> {
+        match dir.symlink_metadata(CARGO_LOCK_NAME) {
+            Ok(_) => Ok(Some(Self { dir, path })),
+            Err(error) if is_absent(&error) => Ok(None),
+            Err(error) => Err(PathError {
+                path: path.join(CARGO_LOCK_NAME),
+                error,
+            }),
+        }
+    }
+
+    /// When the `deps` directory last changed, which it does whenever anything is compiled.
+    fn deps_modified(&self) -> Result<Option<DateTime<Utc>>, PathError> {
+        let path_error = |error| PathError {
+            path: self.path.join("deps"),
+            error,
+        };
+        match self.dir.symlink_metadata("deps") {
+            Ok(metadata) if metadata.is_dir() => {
+                let modified = metadata.modified().map_err(path_error)?;
+                Ok(Some(modified.into_std().into()))
+            }
+            Ok(_) => Ok(None),
+            Err(error) if is_absent(&error) => Ok(None),
+            Err(error) => Err(path_error(error)),
+        }
+    }
+}
+
+/// Finds the build directories of an entry, which are at `target/*` and `target/*/*`.
+///
+/// `entry_path` is only for naming paths in errors.
+fn find_build_dirs(entry_dir: &Dir, entry_path: &Path) -> Result<Vec<BuildDir>, PathError> {
+    let target_path = entry_path.join("target");
+    let target_dir = match entry_dir.open_dir("target") {
+        Ok(target_dir) => target_dir,
+        Err(error) if is_absent(&error) => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(PathError {
+                path: target_path,
+                error,
+            })
+        }
+    };
+
+    let mut build_dirs = Vec::new();
+    for_each_subdir(&target_dir, &target_path, &mut |outer_dir, outer_path| {
+        // With `--target`, the profile directories are one level down.
+        for_each_subdir(&outer_dir, &outer_path, &mut |inner_dir, inner_path| {
+            build_dirs.extend(BuildDir::new(inner_dir, inner_path)?);
+            Ok(())
+        })?;
+        build_dirs.extend(BuildDir::new(outer_dir, outer_path)?);
+        Ok(())
+    })?;
+    Ok(build_dirs)
+}
+
+/// Opens each real directory in `dir` in turn. One at a time, since there can be thousands.
+fn for_each_subdir(
+    dir: &Dir,
+    path: &Path,
+    visit: &mut dyn FnMut(Dir, PathBuf) -> Result<(), PathError>,
+) -> Result<(), PathError> {
+    let path_error = |error| PathError {
+        path: path.to_owned(),
+        error,
+    };
+    for dir_entry in dir.entries().map_err(path_error)? {
+        let dir_entry = dir_entry.map_err(path_error)?;
+        let subdir_path = path.join(dir_entry.file_name());
+        // Not followed, so a symlink to a directory is passed over.
+        let subdir = match dir_entry.metadata() {
+            Ok(metadata) if metadata.is_dir() => dir_entry.open_dir(),
+            Ok(_) => continue,
+            Err(error) => Err(error),
+        };
+        match subdir {
+            Ok(subdir) => visit(subdir, subdir_path)?,
+            Err(error) => {
+                return Err(PathError {
+                    path: subdir_path,
+                    error,
+                })
+            }
+        }
+    }
+    Ok(())
+}
+
+/// When Cargo last built in an entry, going by its `deps` directories.
+///
+/// Unlike `last-used`, this also shows builds that didn't go through targo.
+#[derive(Debug)]
+enum BuildActivity {
+    /// No build directory has a `deps` directory.
+    None,
+    Last(DateTime<Utc>),
+    /// The entry could not be examined, so there may have been a build just now.
+    Unknown(PathError),
+}
+
+impl BuildActivity {
+    fn read(store: &UnlockedStore, name: &EntryName) -> Self {
+        let build_dirs = match store.open_entry_dir(name) {
+            Ok(entry_dir) => {
+                find_build_dirs(entry_dir.dir().as_cap_std(), entry_dir.path().as_ref())
+            }
+            Err(error) => Err(PathError {
+                path: store.entry_path(name).into(),
+                error,
+            }),
+        };
+        match build_dirs {
+            Ok(build_dirs) => Self::of(&build_dirs),
+            Err(error) => Self::Unknown(error),
+        }
+    }
+
+    fn of(build_dirs: &[BuildDir]) -> Self {
+        let mut newest = None;
+        for build_dir in build_dirs {
+            match build_dir.deps_modified() {
+                // `None` is less than any time.
+                Ok(modified) => newest = newest.max(modified),
+                Err(error) => return Self::Unknown(error),
+            }
+        }
+        match newest {
+            Some(built) => Self::Last(built),
+            None => Self::None,
+        }
+    }
+}
+
+impl fmt::Display for BuildActivity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => f.write_str("nothing was built"),
+            Self::Last(built) => write!(f, "last built at {built}"),
+            Self::Unknown(error) => write!(f, "could not examine {error}"),
+        }
+    }
+}
+
+/// An entry with readable metadata, and what was found out about it.
 #[derive(Debug)]
 struct RecognizedEntry {
     name: EntryName,
     last_used: DateTime<Utc>,
+    build_activity: BuildActivity,
     backlinks: Vec<Backlink>,
 }
 
@@ -264,6 +436,7 @@ fn classify(
     store: &UnlockedStore,
     name: EntryName,
     metadata: TargetDirMetadata,
+    build_activity: BuildActivity,
 ) -> RecognizedEntry {
     let entry_target = store.entry_target_path(&name);
     let backlinks = metadata
@@ -278,16 +451,36 @@ fn classify(
         name,
         // An instant, so the local offset in effect when it was recorded can't matter.
         last_used: metadata.last_used.with_timezone(&Utc),
+        build_activity,
         backlinks,
+    }
+}
+
+/// Which of an entry's timestamps is its last activity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActivitySignal {
+    /// `last-used` in the metadata, which only targo updates.
+    LastUsed,
+    /// The newest change to a `deps` directory.
+    LastBuilt,
+}
+
+impl fmt::Display for ActivitySignal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LastUsed => f.write_str("last used"),
+            Self::LastBuilt => f.write_str("last built"),
+        }
     }
 }
 
 /// What gc does with an entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Decision {
-    /// Remove an orphaned entry, last used `idle` ago.
+    /// Remove an orphaned entry, whose last activity was `idle` ago.
     RemoveOrphan {
         idle: Duration,
+        signal: ActivitySignal,
     },
     Keep(KeepReason),
 }
@@ -296,11 +489,29 @@ enum Decision {
 enum KeepReason {
     Live,
     OrphanWithinGrace,
-    UnknownBacklinks,
-    /// The clock went backwards or is wrong, so the age of the entry is unknown.
-    LastUsedInFuture {
-        ahead: Duration,
+    /// Last used longer ago than the grace period, but built in since.
+    OrphanBuiltWithinGrace {
+        idle: Duration,
     },
+    UnknownBacklinks,
+    UnknownBuildActivity,
+    /// The clock went backwards or is wrong, so the age of the entry is unknown.
+    ActivityInFuture {
+        ahead: Duration,
+        signal: ActivitySignal,
+    },
+}
+
+/// How long before `now` the time `at` was, or how far it is ahead of `now`.
+fn time_since(now: DateTime<Utc>, at: DateTime<Utc>) -> Result<Duration, Duration> {
+    let since = now.signed_duration_since(at);
+    // Only a negative duration fails to convert.
+    since.to_std().map_err(|_| {
+        since
+            .abs()
+            .to_std()
+            .expect("an absolute value is not negative")
+    })
 }
 
 /// Decides what to do with `entry` at the time `now`.
@@ -309,19 +520,33 @@ fn decide(entry: &RecognizedEntry, now: DateTime<Utc>, policy: &GcPolicy) -> Dec
         Liveness::Live => KeepReason::Live,
         Liveness::Unknown => KeepReason::UnknownBacklinks,
         Liveness::Orphaned => {
-            let since_last_used = now.signed_duration_since(entry.last_used);
-            // Only a negative duration fails to convert.
-            match since_last_used.to_std() {
-                Ok(idle) if idle >= policy.orphan_grace => {
-                    return Decision::RemoveOrphan { idle };
+            let last_built = match &entry.build_activity {
+                BuildActivity::Unknown(_) => {
+                    return Decision::Keep(KeepReason::UnknownBuildActivity)
                 }
-                Ok(_) => KeepReason::OrphanWithinGrace,
-                Err(_) => KeepReason::LastUsedInFuture {
-                    ahead: since_last_used
-                        .abs()
-                        .to_std()
-                        .expect("an absolute value is not negative"),
+                BuildActivity::None => None,
+                BuildActivity::Last(last_built) => Some(*last_built),
+            };
+            let (last_activity, signal) = match last_built {
+                Some(last_built) if last_built > entry.last_used => {
+                    (last_built, ActivitySignal::LastBuilt)
+                }
+                Some(_) | None => (entry.last_used, ActivitySignal::LastUsed),
+            };
+            match time_since(now, last_activity) {
+                Ok(idle) if idle >= policy.orphan_grace => {
+                    return Decision::RemoveOrphan { idle, signal };
+                }
+                Ok(idle) => match (signal, time_since(now, entry.last_used)) {
+                    // Without the build, the entry would be removed.
+                    (ActivitySignal::LastBuilt, Ok(unused)) if unused >= policy.orphan_grace => {
+                        KeepReason::OrphanBuiltWithinGrace { idle }
+                    }
+                    (ActivitySignal::LastBuilt | ActivitySignal::LastUsed, Ok(_) | Err(_)) => {
+                        KeepReason::OrphanWithinGrace
+                    }
                 },
+                Err(ahead) => KeepReason::ActivityInFuture { ahead, signal },
             }
         }
     };
@@ -513,14 +738,15 @@ impl fmt::Display for ReportedSize {
     }
 }
 
-fn removal_line(entry: &RecognizedEntry, idle: Duration, usage: &DiskUsage) -> String {
+fn removal_line(removal: &Removal, usage: &DiskUsage) -> String {
     let mut size = ReportedSize::default();
     size.add(usage);
     let mut line = format!(
-        "would remove `{}` ({size}): orphaned, last used {} ago; {}",
-        entry.name,
-        Age(idle),
-        BacklinkList(&entry.backlinks),
+        "would remove `{}` ({size}): orphaned, {} {} ago; {}",
+        removal.entry.name,
+        removal.signal,
+        Age(removal.idle),
+        BacklinkList(&removal.entry.backlinks),
     );
     if let Some(unmeasured) = &usage.unmeasured {
         line.push_str(&format!("; could not measure {unmeasured}"));
@@ -532,9 +758,15 @@ fn removal_line(entry: &RecognizedEntry, idle: Duration, usage: &DiskUsage) -> S
 fn kept_line(entry: &RecognizedEntry, reason: KeepReason) -> Option<String> {
     let reason = match reason {
         KeepReason::Live | KeepReason::OrphanWithinGrace => return None,
+        KeepReason::OrphanBuiltWithinGrace { idle } => {
+            format!("orphaned, {} {} ago", ActivitySignal::LastBuilt, Age(idle))
+        }
         KeepReason::UnknownBacklinks => "backlink state unknown".to_owned(),
-        KeepReason::LastUsedInFuture { ahead } => {
-            format!("last used {} in the future", Age(ahead))
+        KeepReason::UnknownBuildActivity => {
+            format!("build activity unknown, {}", entry.build_activity)
+        }
+        KeepReason::ActivityInFuture { ahead, signal } => {
+            format!("{signal} {} in the future", Age(ahead))
         }
     };
     Some(format!(
@@ -558,17 +790,21 @@ struct KeptCounts {
     live: usize,
     orphans_within_grace: usize,
     unknown_backlinks: usize,
+    unknown_build_activity: usize,
     unrecognized: usize,
-    last_used_in_future: usize,
+    activity_in_future: usize,
 }
 
 impl KeptCounts {
     fn add(&mut self, reason: KeepReason) {
         let count = match reason {
             KeepReason::Live => &mut self.live,
-            KeepReason::OrphanWithinGrace => &mut self.orphans_within_grace,
+            KeepReason::OrphanWithinGrace | KeepReason::OrphanBuiltWithinGrace { .. } => {
+                &mut self.orphans_within_grace
+            }
             KeepReason::UnknownBacklinks => &mut self.unknown_backlinks,
-            KeepReason::LastUsedInFuture { .. } => &mut self.last_used_in_future,
+            KeepReason::UnknownBuildActivity => &mut self.unknown_build_activity,
+            KeepReason::ActivityInFuture { .. } => &mut self.activity_in_future,
         };
         *count += 1;
     }
@@ -580,8 +816,9 @@ impl fmt::Display for KeptCounts {
             (self.live, "live"),
             (self.orphans_within_grace, "orphaned within grace"),
             (self.unknown_backlinks, "with unknown backlinks"),
+            (self.unknown_build_activity, "with unknown build activity"),
             (self.unrecognized, "unrecognized"),
-            (self.last_used_in_future, "last used in the future"),
+            (self.activity_in_future, "last active in the future"),
         ];
         let total = counts.iter().map(|(count, _)| count).sum();
         write!(f, "{}", Entries(total))?;
@@ -683,8 +920,12 @@ impl fmt::Display for HumanBytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata::TargoStoreMetadata;
     use cap_std::ambient_authority;
-    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::{
+        os::unix::fs::{symlink, PermissionsExt},
+        time::SystemTime,
+    };
 
     /// A directory nested inside a temp dir, so that a path with `..` in it stays inside.
     struct TestRoot {
@@ -760,6 +1001,20 @@ mod tests {
         }
     }
 
+    /// Opens the store at `store` in `root`, after giving it the metadata that makes it one.
+    fn test_store(root: &TestRoot) -> UnlockedStore {
+        let store_dir = root.create_dir("store");
+        let metadata = serde_json::to_string(&TargoStoreMetadata::new()).expect("serialized");
+        fs::write(
+            store_dir.join(TargoStoreMetadata::METADATA_FILE_NAME),
+            metadata,
+        )
+        .expect("wrote store metadata");
+        UnlockedStore::open(store_dir)
+            .expect("opened store")
+            .expect("the store exists")
+    }
+
     /// A backlink state that can be compared.
     #[derive(Debug, PartialEq, Eq)]
     enum StateKind {
@@ -787,6 +1042,14 @@ mod tests {
     }
 
     fn recognized(states: Vec<BacklinkState>, last_used: DateTime<Utc>) -> RecognizedEntry {
+        recognized_built(states, last_used, BuildActivity::None)
+    }
+
+    fn recognized_built(
+        states: Vec<BacklinkState>,
+        last_used: DateTime<Utc>,
+        build_activity: BuildActivity,
+    ) -> RecognizedEntry {
         let backlinks = states
             .into_iter()
             .enumerate()
@@ -798,8 +1061,16 @@ mod tests {
         RecognizedEntry {
             name: EntryName::new("entry"),
             last_used,
+            build_activity,
             backlinks,
         }
+    }
+
+    /// Sets when the directory at `path` was last modified.
+    fn set_modified(path: &Utf8Path, modified: DateTime<Utc>) {
+        let dir = fs::File::open(path).expect("opened directory");
+        dir.set_modified(SystemTime::from(modified))
+            .expect("set modification time");
     }
 
     fn utc(rfc3339: &str) -> DateTime<Utc> {
@@ -853,10 +1124,25 @@ mod tests {
         let now = utc("2026-03-08T19:00:00Z");
         let ago = |secs: u64| now - Duration::from_secs(secs);
         let ahead = |secs: u64| now + Duration::from_secs(secs);
-        let remove = |idle_secs: u64| Decision::RemoveOrphan {
+        let remove_by = |idle_secs: u64, signal| Decision::RemoveOrphan {
             idle: Duration::from_secs(idle_secs),
+            signal,
         };
+        let remove = |idle_secs: u64| remove_by(idle_secs, ActivitySignal::LastUsed);
         let orphan = |last_used| recognized(vec![BacklinkState::Missing], last_used);
+        let built_orphan = |last_used, last_built| {
+            recognized_built(
+                vec![BacklinkState::Missing],
+                last_used,
+                BuildActivity::Last(last_built),
+            )
+        };
+        let unknown_activity = || {
+            BuildActivity::Unknown(PathError {
+                path: "/store/entry/target".into(),
+                error: io::Error::other("no access"),
+            })
+        };
 
         // Each case is the grace period in seconds, the entry, and the expected outcome.
         let data = [
@@ -876,15 +1162,17 @@ mod tests {
             (
                 0,
                 orphan(ahead(1)),
-                Decision::Keep(KeepReason::LastUsedInFuture {
+                Decision::Keep(KeepReason::ActivityInFuture {
                     ahead: Duration::from_secs(1),
+                    signal: ActivitySignal::LastUsed,
                 }),
             ),
             (
                 DAY,
                 orphan(ahead(3 * DAY)),
-                Decision::Keep(KeepReason::LastUsedInFuture {
+                Decision::Keep(KeepReason::ActivityInFuture {
                     ahead: Duration::from_secs(3 * DAY),
+                    signal: ActivitySignal::LastUsed,
                 }),
             ),
             // With no backlinks at all, nothing links to the entry.
@@ -918,6 +1206,84 @@ mod tests {
             (
                 DAY,
                 recognized(vec![unknown()], ahead(DAY)),
+                Decision::Keep(KeepReason::UnknownBacklinks),
+            ),
+            // The later of the two times counts, whichever it is.
+            (
+                DAY,
+                built_orphan(ago(3 * DAY), ago(2 * DAY)),
+                remove_by(2 * DAY, ActivitySignal::LastBuilt),
+            ),
+            (
+                DAY,
+                built_orphan(ago(2 * DAY), ago(3 * DAY)),
+                remove(2 * DAY),
+            ),
+            (DAY, built_orphan(ago(DAY), ago(DAY)), remove(DAY)),
+            (
+                DAY,
+                built_orphan(ago(3 * DAY), ago(DAY)),
+                remove_by(DAY, ActivitySignal::LastBuilt),
+            ),
+            (
+                DAY,
+                built_orphan(ago(3 * DAY), ago(DAY - 1)),
+                Decision::Keep(KeepReason::OrphanBuiltWithinGrace {
+                    idle: Duration::from_secs(DAY - 1),
+                }),
+            ),
+            (
+                DAY,
+                built_orphan(ago(400 * DAY), now),
+                Decision::Keep(KeepReason::OrphanBuiltWithinGrace {
+                    idle: Duration::ZERO,
+                }),
+            ),
+            // The last use alone keeps these, so the build is not the reason.
+            (
+                DAY,
+                built_orphan(ago(3600), ago(60)),
+                Decision::Keep(KeepReason::OrphanWithinGrace),
+            ),
+            (
+                DAY,
+                built_orphan(ago(60), ago(3 * DAY)),
+                Decision::Keep(KeepReason::OrphanWithinGrace),
+            ),
+            (
+                DAY,
+                built_orphan(ago(3 * DAY), ahead(60)),
+                Decision::Keep(KeepReason::ActivityInFuture {
+                    ahead: Duration::from_secs(60),
+                    signal: ActivitySignal::LastBuilt,
+                }),
+            ),
+            (
+                DAY,
+                built_orphan(ahead(60), ago(3 * DAY)),
+                Decision::Keep(KeepReason::ActivityInFuture {
+                    ahead: Duration::from_secs(60),
+                    signal: ActivitySignal::LastUsed,
+                }),
+            ),
+            // An entry that can't be examined may have been built in a moment ago.
+            (
+                0,
+                recognized_built(
+                    vec![BacklinkState::Missing],
+                    ago(400 * DAY),
+                    unknown_activity(),
+                ),
+                Decision::Keep(KeepReason::UnknownBuildActivity),
+            ),
+            (
+                DAY,
+                recognized_built(vec![BacklinkState::Live], ago(DAY), unknown_activity()),
+                Decision::Keep(KeepReason::Live),
+            ),
+            (
+                DAY,
+                recognized_built(vec![unknown()], ago(DAY), unknown_activity()),
                 Decision::Keep(KeepReason::UnknownBacklinks),
             ),
         ];
@@ -1187,12 +1553,149 @@ mod tests {
     }
 
     #[test]
-    fn test_removal_line_with_unmeasured_paths() {
-        let entry = recognized(
-            vec![BacklinkState::Missing, BacklinkState::NotASymlink],
-            utc("2026-03-08T19:00:00Z"),
+    fn test_build_activity() {
+        let root = TestRoot::new();
+        let entry = root.create_dir("store/entry");
+        let read = || {
+            let entry_dir = Dir::open_ambient_dir(&entry, ambient_authority()).expect("opened");
+            let build_dirs = find_build_dirs(&entry_dir, entry.as_std_path());
+            let build_dirs = build_dirs.expect("found build dirs");
+            let mut paths: Vec<_> = build_dirs.iter().map(|dir| dir.path.clone()).collect();
+            paths.sort();
+            (paths, BuildActivity::of(&build_dirs))
+        };
+        let assert_activity = |expected: Option<DateTime<Utc>>, when: &str| match read().1 {
+            BuildActivity::None => assert_eq!(None, expected, "{when}"),
+            BuildActivity::Last(built) => assert_eq!(Some(built), expected, "{when}"),
+            BuildActivity::Unknown(error) => panic!("{when}, the activity is unknown: {error}"),
+        };
+        let build_dir = |relative: &str| {
+            root.write_file(&format!("store/entry/{relative}/.cargo-lock"), 0);
+            let deps = root.create_dir(&format!("store/entry/{relative}/deps"));
+            move |modified| set_modified(&deps, modified)
+        };
+        let old = utc("2026-03-01T12:00:00Z");
+        let older = utc("2026-02-01T12:00:00Z");
+        let new = utc("2026-03-08T12:00:00Z");
+        let newer = utc("2026-03-08T19:00:00Z");
+
+        assert_activity(None, "without a target directory");
+        root.create_dir("store/entry/target");
+        assert_activity(None, "with an empty target directory");
+
+        // None of these is a `deps` directory next to a `.cargo-lock` at depth 1 or 2.
+        set_modified(&root.create_dir("store/entry/target/doc/deps"), newer);
+        set_modified(&root.create_dir("store/entry/target/deps"), newer);
+        set_modified(&root.create_dir("store/entry/target/a/b/c/deps"), newer);
+        root.write_file("store/entry/target/a/b/c/.cargo-lock", 0);
+        root.write_file("store/entry/target/.cargo-lock", 0);
+        root.write_file("store/entry/target/no-deps/.cargo-lock", 0);
+        root.write_file("store/entry/target/file-deps/.cargo-lock", 0);
+        root.write_file("store/entry/target/file-deps/deps", 0);
+        root.symlink(
+            root.path("store/entry/target/doc"),
+            "store/entry/target/link",
         );
-        let idle = Duration::from_secs(3 * 24 * 60 * 60);
+        assert_activity(None, "without a deps directory in a build directory");
+
+        let set_debug = build_dir("target/debug");
+        let set_triple_release = build_dir("target/x86_64-unknown-linux-gnu/release");
+        let build_dir_paths: Vec<_> = [
+            "target/debug",
+            "target/file-deps",
+            "target/no-deps",
+            "target/x86_64-unknown-linux-gnu/release",
+        ]
+        .map(|relative| entry.join(relative).into_std_path_buf())
+        .into();
+        assert_eq!(read().0, build_dir_paths);
+
+        // The newest counts, at either depth.
+        set_debug(old);
+        set_triple_release(older);
+        assert_activity(Some(old), "with the newest at depth 1");
+        set_triple_release(new);
+        assert_activity(Some(new), "with the newest at depth 2");
+    }
+
+    #[test]
+    fn test_build_activity_unknown() {
+        let root = TestRoot::new();
+        root.write_file("store/entry/target/debug/.cargo-lock", 0);
+        root.create_dir("store/entry/target/debug/deps");
+        let store = test_store(&root);
+        let locked = root.path("store/entry/target/debug");
+        let Some(_locked) = LockedDir::new(locked.clone()) else {
+            return;
+        };
+
+        match BuildActivity::read(&store, &EntryName::new("entry")) {
+            BuildActivity::Unknown(error) => assert_eq!(
+                (error.path, error.error.kind()),
+                (locked.into(), io::ErrorKind::PermissionDenied)
+            ),
+            activity => panic!("the activity is {activity:?}"),
+        }
+    }
+
+    #[test]
+    fn test_kept_lines_and_counts() {
+        let last_used = utc("2026-03-08T19:00:00Z");
+        let unknown_activity = BuildActivity::Unknown(PathError {
+            path: "/store/entry/target".into(),
+            error: io::Error::other("no access"),
+        });
+        let entry = recognized_built(vec![], last_used, unknown_activity);
+        let hour = Duration::from_secs(60 * 60);
+
+        let data = [
+            (KeepReason::Live, None),
+            (KeepReason::OrphanWithinGrace, None),
+            (
+                KeepReason::OrphanBuiltWithinGrace { idle: 3 * hour },
+                Some("would keep `entry`: orphaned, last built 3h ago; no backlinks"),
+            ),
+            (
+                KeepReason::UnknownBuildActivity,
+                Some(
+                    "would keep `entry`: build activity unknown, could not examine \
+                     `/store/entry/target`: no access; no backlinks",
+                ),
+            ),
+            (
+                KeepReason::ActivityInFuture {
+                    ahead: 2 * hour,
+                    signal: ActivitySignal::LastBuilt,
+                },
+                Some("would keep `entry`: last built 2h in the future; no backlinks"),
+            ),
+        ];
+        let mut kept_counts = KeptCounts::default();
+        for (reason, expected) in data {
+            assert_eq!(
+                kept_line(&entry, reason).as_deref(),
+                expected,
+                "for {reason:?}"
+            );
+            kept_counts.add(reason);
+        }
+        assert_eq!(
+            kept_counts.to_string(),
+            "5 entries: 1 live, 2 orphaned within grace, \
+             1 with unknown build activity, 1 last active in the future"
+        );
+    }
+
+    #[test]
+    fn test_removal_line_with_unmeasured_paths() {
+        let removal = Removal {
+            entry: recognized(
+                vec![BacklinkState::Missing, BacklinkState::NotASymlink],
+                utc("2026-03-08T19:00:00Z"),
+            ),
+            idle: Duration::from_secs(3 * 24 * 60 * 60),
+            signal: ActivitySignal::LastUsed,
+        };
 
         let data = [
             (0, ""),
@@ -1211,7 +1714,7 @@ mod tests {
                 }),
             };
             assert_eq!(
-                removal_line(&entry, idle, &lower_bound),
+                removal_line(&removal, &lower_bound),
                 format!(
                     "would remove `entry` (at least 1.5 KiB): orphaned, last used 3d ago; \
                      backlinks: `/workspace-0/target` (missing), `/workspace-1/target` \

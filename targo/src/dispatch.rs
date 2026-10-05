@@ -54,7 +54,7 @@ pub enum TargoCommand {
         #[arg(
             long,
             value_name = "DURATION",
-            default_value = "1d",
+            default_value = "7d",
             value_parser = humantime::parse_duration,
         )]
         orphan_grace: Duration,
@@ -640,8 +640,9 @@ mod tests {
             TargoApp::try_parse_from(app_args.chain(shell_args(input)))
         };
 
+        const WEEK: Duration = Duration::from_secs(7 * 24 * 60 * 60);
         let data = [
-            ("--dry-run", Duration::from_secs(24 * 60 * 60)),
+            ("--dry-run", WEEK),
             ("--orphan-grace 90m --dry-run", Duration::from_secs(90 * 60)),
             ("--dry-run --orphan-grace=0s", Duration::ZERO),
         ];

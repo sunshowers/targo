@@ -25,7 +25,7 @@ fn gc_dry_run_reports_and_changes_nothing() {
     create_symlink(&live_target, &live_link);
 
     let gone_link = workspaces.join("gone/target");
-    let orphan = store.create_entry("orphan", &[&gone_link], -(3 * DAY + 12 * HOUR));
+    let orphan = store.create_entry("orphan", &[&gone_link], -(8 * DAY + 12 * HOUR));
     write_synced(&orphan.join("target/built-file"), &[b'x'; 64 * 1024]);
 
     // Older than the other orphan, so it is reported first even though its name sorts last.
@@ -48,7 +48,7 @@ fn gc_dry_run_reports_and_changes_nothing() {
         -(20 * DAY + 12 * HOUR),
     );
 
-    store.create_entry("no-backlinks", &[], -(2 * DAY + 12 * HOUR));
+    store.create_entry("no-backlinks", &[], -(7 * DAY + 12 * HOUR));
     store.create_entry("recent-orphan", &[&gone_link], -HOUR);
     let recently_built = store.create_entry("recently-built", &[&gone_link], -400 * DAY);
     store.create_build_dir(&recently_built, "target/debug", -(HOUR + HOUR / 2));
@@ -97,9 +97,9 @@ fn gc_dry_run_reports_and_changes_nothing() {
          backlinks: `{relinked_link}` (points elsewhere), `{replaced_link}` (not a symlink)\n\
          would remove `built-long-ago` ({}): orphaned, last built 20d ago; \
          backlinks: `{gone_link}` (missing)\n\
-         would remove `orphan` ({}): orphaned, last used 3d ago; \
+         would remove `orphan` ({}): orphaned, last used 8d ago; \
          backlinks: `{gone_link}` (missing)\n\
-         would remove `no-backlinks` ({}): orphaned, last used 2d ago; no backlinks\n\
+         would remove `no-backlinks` ({}): orphaned, last used 7d ago; no backlinks\n\
          would keep `corrupt`: unrecognized; \
          failed to deserialize metadata from `{corrupt_metadata_path}`: {json_error}\n\
          would keep `empty`: unrecognized; it has no `target-dir-metadata.json`\n\

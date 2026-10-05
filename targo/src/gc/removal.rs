@@ -1,8 +1,8 @@
-//! Removing entries: the second look under `targo.lock`, the trash, and deletion.
+//! Removing and emptying entries: the second look under `targo.lock`, the trash, and deletion.
 
 use super::{
     classify, decide, find_build_dirs, BuildActivity, BuildDir, Clock, Decision, DiskUsage,
-    GcPolicy, InUse, Measured, Outcome, PathErrors, Removal, UsageWalk, CARGO_LOCK_NAME,
+    Emptying, GcPolicy, InUse, Measured, Outcome, PathErrors, Removal, UsageWalk, CARGO_LOCK_NAME,
 };
 use crate::{
     helpers::{try_lock_exclusive, ExclusiveLock, TryLock},
@@ -22,10 +22,13 @@ use std::{
     process,
 };
 
-/// The directory in the store that entries are moved into before they are deleted.
+/// The directory in the store that things are moved into before they are deleted.
 const TRASH_DIR_NAME: &str = ".targo-trash";
 
-/// A gc run that removes entries. It holds `gc.lock`, so there is only one at a time.
+/// In a target directory: where tests keep files. Cargo makes it only when it compiles a test.
+const TEST_TMP_DIR_NAME: &str = "tmp";
+
+/// A gc run that removes and empties entries. It holds `gc.lock`, so there is only one at a time.
 #[derive(Debug)]
 pub(super) struct Remover<'a> {
     store: &'a UnlockedStore,
@@ -86,6 +89,12 @@ impl<'a> Remover<'a> {
         let lock = self.store.lock()?;
         let moved = match recheck(&lock, name, policy, clock) {
             Ok(Recheck::Remove(permit)) => permit.move_to_trash(&self.trash, &mut self.names),
+            // It is live now. The size that was measured is not what emptying it would free.
+            Ok(Recheck::Empty(permit)) => {
+                drop(permit);
+                lock.unlock()?;
+                return Ok(links_changed(name));
+            }
             Ok(Recheck::Leave(outcome)) => {
                 lock.unlock()?;
                 return Ok(outcome);
@@ -95,18 +104,57 @@ impl<'a> Remover<'a> {
         // Released before the slow part, so that `wrap-cargo` never waits for a deletion.
         lock.unlock()?;
 
-        let failed = |error| Outcome::Failed {
-            name: name.clone(),
-            error,
-        };
-        let trashed = match moved {
-            Ok(trashed) => trashed,
-            Err(error) => return Ok(failed(error)),
-        };
-        Ok(match trashed.delete(&self.trash) {
+        let deleted = moved.and_then(|trashed| trashed.delete(&self.trash));
+        Ok(match deleted {
             Ok(removal) => Outcome::Removed { removal, usage },
-            Err(error) => failed(error),
+            Err(error) => Outcome::RemoveFailed {
+                name: name.clone(),
+                error,
+            },
         })
+    }
+
+    /// Empties the target directory of the entry `name`, if a second look under `targo.lock`
+    /// still finds it live and idle. Errors are as for [`Self::remove`].
+    pub(super) fn empty(
+        &mut self,
+        name: &EntryName,
+        usage: DiskUsage,
+        policy: &GcPolicy,
+        clock: Clock<'_>,
+    ) -> Result<Outcome> {
+        let lock = self.store.lock()?;
+        let moved = match recheck(&lock, name, policy, clock) {
+            Ok(Recheck::Empty(permit)) => permit.move_to_trash(&self.trash, &mut self.names),
+            // It is an orphan now, which is not emptied. The next run removes it.
+            Ok(Recheck::Remove(permit)) => {
+                drop(permit);
+                lock.unlock()?;
+                return Ok(links_changed(name));
+            }
+            Ok(Recheck::Leave(outcome)) => {
+                lock.unlock()?;
+                return Ok(outcome);
+            }
+            Err(error) => Err(error),
+        };
+        lock.unlock()?;
+
+        let deleted = moved.and_then(|trashed| trashed.delete(&self.trash));
+        Ok(match deleted {
+            Ok(emptying) => Outcome::Emptied { emptying, usage },
+            Err(error) => Outcome::EmptyFailed {
+                name: name.clone(),
+                error,
+            },
+        })
+    }
+}
+
+fn links_changed(name: &EntryName) -> Outcome {
+    Outcome::InUse {
+        name: name.clone(),
+        reason: InUse::LinksChanged,
     }
 }
 
@@ -114,7 +162,8 @@ impl<'a> Remover<'a> {
 #[derive(Debug)]
 pub(super) enum Recheck<'a> {
     Remove(RemovalPermit<'a>),
-    /// The entry stays in the store, for the reason that the outcome gives.
+    Empty(EmptyPermit<'a>),
+    /// The entry stays as it is, for the reason that the outcome gives.
     Leave(Outcome),
 }
 
@@ -126,6 +175,16 @@ pub(super) struct RemovalPermit<'a> {
     lock: &'a StoreLock<'a>,
     removal: Removal,
     // Held until the entry is in the trash, so that Cargo can't start a build in it.
+    _cargo_locks: Vec<fs::File>,
+}
+
+/// Leave to empty an entry's target directory. Only [`recheck`] gives it, as for a removal.
+#[derive(Debug)]
+#[must_use]
+pub(super) struct EmptyPermit<'a> {
+    lock: &'a StoreLock<'a>,
+    emptying: Emptying,
+    // Held until the contents are in the trash.
     _cargo_locks: Vec<fs::File>,
 }
 
@@ -146,8 +205,8 @@ pub(super) fn recheck<'a>(
         .wrap_err_with(|| format!("failed to open `{}`", store.entry_path(name)))?;
 
     let mut cargo_locks = Vec::new();
-    let build_dirs = find_build_dirs(entry_dir.dir().as_cap_std(), entry_dir.path().as_ref());
-    let build_activity = match build_dirs {
+    let (entry_dir, entry_path) = (entry_dir.dir().as_cap_std(), entry_dir.path().as_ref());
+    let build_activity = match find_build_dirs(entry_dir, entry_path) {
         Ok(build_dirs) => {
             for build_dir in &build_dirs {
                 match build_dir.try_lock()? {
@@ -161,7 +220,7 @@ pub(super) fn recheck<'a>(
                 }
             }
             // Read with Cargo's locks held, so that a build that has just ended is seen.
-            BuildActivity::of(&build_dirs)
+            BuildActivity::of(entry_dir, entry_path, &build_dirs)
         }
         Err(error) => BuildActivity::Unknown(error),
     };
@@ -176,6 +235,18 @@ pub(super) fn recheck<'a>(
             Ok(Recheck::Remove(RemovalPermit {
                 lock,
                 removal: Removal {
+                    entry,
+                    idle,
+                    signal,
+                },
+                _cargo_locks: cargo_locks,
+            }))
+        }
+        Decision::EmptyLive { idle, signal } => {
+            store.ensure_at_path()?;
+            Ok(Recheck::Empty(EmptyPermit {
+                lock,
+                emptying: Emptying {
                     entry,
                     idle,
                     signal,
@@ -229,6 +300,98 @@ impl RemovalPermit<'_> {
             trash_name,
             removal: self.removal,
         })
+    }
+}
+
+impl EmptyPermit<'_> {
+    /// Moves what is in the entry's target directory into a new directory in the trash. The
+    /// directory itself stays, so a workspace's `target` symlink never dangles.
+    fn move_to_trash(self, trash: &TrashDir, names: &mut TrashNames) -> Result<TrashedContents> {
+        let store = self.lock.store();
+        let name = &self.emptying.entry.name;
+        let target_path = store.entry_target_path(name);
+        let move_error = || {
+            format!(
+                "failed to move the contents of `{target_path}` into `{}`",
+                trash.path
+            )
+        };
+        let target_dir = store
+            .open_entry_target_dir(name)
+            .wrap_err_with(move_error)?;
+        let target_dir = target_dir.dir().as_cap_std();
+        // Listed before anything is moved: a rename changes the directory that is being read.
+        let mut child_names = Vec::new();
+        for dir_entry in target_dir.entries().wrap_err_with(move_error)? {
+            child_names.push(dir_entry.wrap_err_with(move_error)?.file_name());
+        }
+        child_names.sort();
+        // Last: a test that is already built fails without it, so it must outlast the builds.
+        child_names.sort_by_key(|child_name| child_name == TEST_TMP_DIR_NAME);
+
+        let trash_name = names.unused(&trash.dir).wrap_err_with(move_error)?;
+        trash
+            .dir
+            .create_dir(&trash_name)
+            .wrap_err_with(move_error)?;
+        let trash_subdir = trash.dir.open_dir(&trash_name).wrap_err_with(move_error)?;
+        let (mut moved, mut left_behind) = (0_u64, None);
+        for child_name in child_names {
+            // Each is moved in one step, and a failure doesn't stop the rest from going.
+            let result = if child_name == TEST_TMP_DIR_NAME && left_behind.is_some() {
+                Err(io::Error::other("a build that was left behind may need it"))
+            } else {
+                target_dir.rename(&child_name, &trash_subdir, &child_name)
+            };
+            match result {
+                Ok(()) => moved += 1,
+                // Something else removed it first.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    let child_path = target_path.as_std_path().join(child_name);
+                    tracing::debug!("could not move `{}`: {error}", child_path.display());
+                    PathErrors::record(&mut left_behind, child_path, error);
+                }
+            }
+        }
+        Ok(TrashedContents {
+            trash_name,
+            emptying: self.emptying,
+            moved,
+            left_behind,
+        })
+    }
+}
+
+/// What was in an entry's target directory, now in a directory in the trash.
+#[derive(Debug)]
+#[must_use]
+struct TrashedContents {
+    trash_name: String,
+    emptying: Emptying,
+    /// How many children of the target directory were moved.
+    moved: u64,
+    /// What could not be moved, and so is still in the target directory.
+    left_behind: Option<PathErrors>,
+}
+
+impl TrashedContents {
+    /// Deletes the contents, which can take minutes and doesn't need `targo.lock`.
+    fn delete(self, trash: &TrashDir) -> Result<Emptying> {
+        let deleted = trash.delete(OsStr::new(&self.trash_name));
+        match (deleted, self.left_behind) {
+            (Ok(()), None) => Ok(self.emptying),
+            (Ok(()), Some(left_behind)) => Err(match self.moved {
+                0 => eyre!("could not move {left_behind}; nothing was deleted"),
+                _ => eyre!(
+                    "could not move {left_behind}; the rest of the target directory was deleted"
+                ),
+            }),
+            (Err(error), None) => Err(error),
+            (Err(error), Some(left_behind)) => Err(error.wrap_err(format!(
+                "could not move {left_behind}, and could not delete what was moved"
+            ))),
+        }
     }
 }
 
@@ -539,6 +702,7 @@ mod tests {
         collections::HashSet,
         os::unix::fs::{MetadataExt as _, PermissionsExt},
         path::{Component, Path},
+        slice,
         time::Duration,
     };
 
@@ -552,6 +716,15 @@ mod tests {
     fn policy() -> GcPolicy {
         GcPolicy {
             orphan_grace: Duration::from_secs(7 * DAY),
+            max_age: None,
+        }
+    }
+
+    /// A policy that also empties a live entry, once it has been idle for 30 days.
+    fn max_age_policy() -> GcPolicy {
+        GcPolicy {
+            max_age: Some(Duration::from_secs(30 * DAY)),
+            ..policy()
         }
     }
 
@@ -581,20 +754,42 @@ mod tests {
         );
     }
 
+    /// Creates an entry that a workspace links to, last used 60 days ago. Returns the link.
+    fn write_live(root: &TestRoot, name: &str) -> Utf8PathBuf {
+        let target = root.path(&format!("store/{name}/target"));
+        let backlink = root.symlink(&target, &format!("workspaces/{name}/target"));
+        write_entry(
+            root,
+            name,
+            &[&backlink],
+            now() - Duration::from_secs(60 * DAY),
+        );
+        backlink
+    }
+
     /// The entries that are to be removed going by a look at the store without any lock.
     fn list_removals(store: &UnlockedStore) -> Vec<EntryName> {
-        let mut names = Vec::new();
+        list_collections(store, &policy()).0
+    }
+
+    /// The entries that are to be removed, and those that are to be emptied.
+    fn list_collections(
+        store: &UnlockedStore,
+        policy: &GcPolicy,
+    ) -> (Vec<EntryName>, Vec<EntryName>) {
+        let (mut removals, mut emptyings) = (Vec::new(), Vec::new());
         for entry in store.entries().expect("listed entries") {
             let StoreEntry::Recognized { name, metadata } = entry else {
                 continue;
             };
-            let entry = examine(store, name, metadata, now(), &policy());
-            match decide(&entry, now(), &policy()) {
-                Decision::RemoveOrphan { .. } => names.push(entry.name),
+            let entry = examine(store, name, metadata, now(), policy);
+            match decide(&entry, now(), policy) {
+                Decision::RemoveOrphan { .. } => removals.push(entry.name),
+                Decision::EmptyLive { .. } => emptyings.push(entry.name),
                 Decision::Keep(_) => {}
             }
         }
-        names
+        (removals, emptyings)
     }
 
     /// Why a second look left an entry in the store.
@@ -607,8 +802,13 @@ mod tests {
 
     /// Takes a second look at `name`, which must leave it in the store.
     fn recheck_left(store: &UnlockedStore, name: &EntryName) -> Left {
+        recheck_left_with(store, name, &policy())
+    }
+
+    /// Takes a second look at `name` under `policy`, which must leave it as it is.
+    fn recheck_left_with(store: &UnlockedStore, name: &EntryName, policy: &GcPolicy) -> Left {
         let lock = store.lock().expect("locked store");
-        match recheck(&lock, name, &policy(), &now).expect("rechecked") {
+        match recheck(&lock, name, policy, &now).expect("rechecked") {
             Recheck::Leave(Outcome::Kept { reason, .. }) => Left::Kept(reason),
             Recheck::Leave(Outcome::Unrecognized(_)) => Left::Unrecognized,
             Recheck::Leave(Outcome::InUse {
@@ -769,26 +969,172 @@ mod tests {
     }
 
     #[test]
-    fn test_recheck_fails_once_the_store_is_replaced() {
-        let root = TestRoot::new();
-        write_orphan(&root, "entry");
-        let store = test_store(&root);
-        let lock = store.lock().expect("locked store");
+    fn test_recheck_leaves_a_live_entry_that_changed_after_it_was_listed() {
+        // Each case is a change to a live entry made after it was listed as one to empty,
+        // and the grace period in days.
+        const BACKLINK: &str = "workspaces/entry/target";
+        const BUILT_FILE: &str = "store/entry/target/built-file";
+        type Change = fn(&TestRoot);
+        let data: [(&str, Change, u64, Left); 7] = [
+            (
+                "it was used again",
+                |root| write_entry(root, "entry", &[&root.path(BACKLINK)], now()),
+                7,
+                Left::Kept(KeepReason::Live),
+            ),
+            (
+                "something was built in it",
+                |root| {
+                    root.write_file("store/entry/target/debug/.cargo-lock", 0);
+                    let deps = root.create_dir("store/entry/target/debug/deps");
+                    set_modified(&deps, now() - Duration::from_secs(HOUR));
+                },
+                7,
+                Left::Kept(KeepReason::Live),
+            ),
+            (
+                "something else emptied its target directory",
+                |root| fs::remove_file(root.path(BUILT_FILE)).expect("removed file"),
+                7,
+                Left::Kept(KeepReason::LiveAlreadyEmpty),
+            ),
+            (
+                "its workspace is gone, and the grace period is longer than the maximum age",
+                |root| fs::remove_file(root.path(BACKLINK)).expect("removed link"),
+                90,
+                Left::Kept(KeepReason::OrphanWithinGrace),
+            ),
+            (
+                "its backlink can no longer be examined",
+                |root| {
+                    fs::remove_file(root.path(BACKLINK)).expect("removed link");
+                    root.symlink("target", BACKLINK);
+                },
+                7,
+                Left::Kept(KeepReason::UnknownBacklinks),
+            ),
+            (
+                "its target directory can no longer be examined",
+                |root| {
+                    root.write_file("store/entry/target/debug/.cargo-lock", 0);
+                    root.symlink("build", "store/entry/target/debug/build");
+                },
+                7,
+                Left::Kept(KeepReason::UnknownBuildActivity),
+            ),
+            (
+                "its metadata is corrupt",
+                |root| fs::write(metadata_path(root, "entry"), "{").expect("wrote metadata"),
+                7,
+                Left::Unrecognized,
+            ),
+        ];
+        for (change_name, change, grace_days, expected) in data {
+            let root = TestRoot::new();
+            write_live(&root, "entry");
+            root.write_file(BUILT_FILE, 1);
+            let store = test_store(&root);
+            let policy = GcPolicy {
+                orphan_grace: Duration::from_secs(grace_days * DAY),
+                ..max_age_policy()
+            };
+            let (removals, emptyings) = list_collections(&store, &policy);
+            assert_eq!(
+                (removals.as_slice(), emptyings.as_slice()),
+                (&[][..], &[EntryName::new("entry")][..]),
+                "before {change_name}"
+            );
 
-        // As when the path is pointed at another disk after the lock was taken.
-        fs::rename(root.path("store"), root.path("moved-store")).expect("moved store");
-        root.create_dir("store");
-        let error = recheck(&lock, &EntryName::new("entry"), &policy(), &now)
-            .expect_err("another directory is at the store's path");
-        let expected = format!(
-            "targo store directory `{}` was replaced by another directory",
-            root.path("store")
+            change(&root);
+
+            let after_change = names_in(&root.path("store/entry/target"));
+            assert_eq!(
+                recheck_left_with(&store, &emptyings[0], &policy),
+                expected,
+                "{change_name}"
+            );
+            assert_eq!(
+                names_in(&root.path("store/entry/target")),
+                after_change,
+                "{change_name}, and nothing was moved"
+            );
+            assert!(
+                !names_in(&root.path("store")).contains(&TRASH_DIR_NAME.to_owned()),
+                "{change_name}, and nothing was moved"
+            );
+        }
+    }
+
+    #[test]
+    fn test_recheck_leaves_a_live_entry_that_cargo_builds_in() {
+        let root = TestRoot::new();
+        write_live(&root, "entry");
+        let lock_path = root.write_file("store/entry/target/debug/.cargo-lock", 0);
+        let store = test_store(&root);
+        let name = EntryName::new("entry");
+        let is_held = || {
+            let probe = fs::File::open(&lock_path).expect("opened Cargo's lock");
+            match try_lock_exclusive(probe).expect("tried Cargo's lock") {
+                TryLock::Acquired(_) => false,
+                TryLock::Busy => true,
+            }
+        };
+
+        // As Cargo holds it for the length of a build.
+        let cargo_lock = fs::File::open(&lock_path).expect("opened Cargo's lock");
+        FileExt::lock_exclusive(&cargo_lock).expect("locked as Cargo does");
+        assert_eq!(
+            recheck_left_with(&store, &name, &max_age_policy()),
+            Left::InUse(lock_path.clone().into())
         );
-        assert!(
-            error.to_string().starts_with(&expected),
-            "error was: {error}"
-        );
-        assert!(root.path("moved-store/entry").is_dir());
+
+        drop(cargo_lock);
+        let lock = store.lock().expect("locked store");
+        let permit = match recheck(&lock, &name, &max_age_policy(), &now).expect("rechecked") {
+            Recheck::Empty(permit) => permit,
+            recheck => panic!("the second look came to {recheck:?}"),
+        };
+        assert!(is_held(), "Cargo is kept out while the contents are moved");
+        drop(permit);
+        assert!(!is_held());
+    }
+
+    #[test]
+    fn test_recheck_fails_once_the_store_is_replaced() {
+        type Setup = fn(&TestRoot);
+        // Each case is an entry that would otherwise be removed, or be emptied.
+        let data: [(Setup, GcPolicy); 2] = [
+            (|root| write_orphan(root, "entry"), policy()),
+            (
+                |root| {
+                    write_live(root, "entry");
+                },
+                max_age_policy(),
+            ),
+        ];
+        for (setup, policy) in data {
+            let root = TestRoot::new();
+            setup(&root);
+            root.write_file("store/entry/target/built-file", 1);
+            let store = test_store(&root);
+            let lock = store.lock().expect("locked store");
+
+            // As when the path is pointed at another disk after the lock was taken. A link
+            // to the entry then leads into the new store.
+            fs::rename(root.path("store"), root.path("moved-store")).expect("moved store");
+            root.create_dir("store/entry/target");
+            let error = recheck(&lock, &EntryName::new("entry"), &policy, &now)
+                .expect_err("another directory is at the store's path");
+            let expected = format!(
+                "targo store directory `{}` was replaced by another directory",
+                root.path("store")
+            );
+            assert!(
+                error.to_string().starts_with(&expected),
+                "error was: {error}"
+            );
+            assert!(root.path("moved-store/entry/target/built-file").is_file());
+        }
     }
 
     #[test]
@@ -908,6 +1254,250 @@ mod tests {
             [taken_name],
             "the leftover is not touched"
         );
+    }
+
+    fn start_remover(store: &UnlockedStore) -> Remover<'_> {
+        match Remover::start(store, now()).expect("started") {
+            TryLock::Acquired(remover) => remover,
+            TryLock::Busy => panic!("no other gc is running"),
+        }
+    }
+
+    fn no_usage() -> DiskUsage {
+        DiskUsage {
+            bytes: 0,
+            unmeasured: None,
+        }
+    }
+
+    fn inode_of(path: &Utf8Path) -> u64 {
+        fs::symlink_metadata(path).expect("read metadata").ino()
+    }
+
+    #[test]
+    fn test_remover_empties_only_what_a_second_look_permits() {
+        let root = TestRoot::new();
+        let stale_link = write_live(&root, "stale");
+        let orphaned_link = write_live(&root, "orphaned");
+        write_live(&root, "used");
+        write_orphan(&root, "adopted");
+        let outside_file = root.write_file("outside/file", 1);
+        // Everything in the target directory goes, whatever made it.
+        for name in ["stale", "orphaned", "used", "adopted"] {
+            root.write_file(&format!("store/{name}/target/CACHEDIR.TAG"), 1);
+            root.write_file(&format!("store/{name}/target/.rustc_info.json"), 1);
+            root.write_file(&format!("store/{name}/target/debug/.cargo-lock"), 0);
+            root.write_file(&format!("store/{name}/target/debug/deps/built-file"), 1);
+            root.write_file(
+                &format!("store/{name}/target/rust-analyzer/flycheck0/file"),
+                1,
+            );
+            root.symlink(&outside_file, &format!("store/{name}/target/link"));
+            set_modified(
+                &root.path(&format!("store/{name}/target/debug/deps")),
+                now() - Duration::from_secs(45 * DAY),
+            );
+        }
+        let store = test_store(&root);
+        let policy = max_age_policy();
+        let (removals, emptyings) = list_collections(&store, &policy);
+        assert_eq!(removals, [EntryName::new("adopted")]);
+        assert_eq!(emptyings, ["orphaned", "stale", "used"].map(EntryName::new));
+        let [orphaned, stale, used] = &emptyings[..] else {
+            panic!("three entries are to be emptied");
+        };
+        let contents = names_in(&root.path("store/stale/target"));
+        let stale_target_inode = inode_of(&root.path("store/stale/target"));
+
+        // What changed since the entries were listed.
+        fs::remove_file(&orphaned_link).expect("removed link");
+        write_entry(
+            &root,
+            "used",
+            &[&root.path("workspaces/used/target")],
+            now(),
+        );
+        let adopted_link = root.symlink(
+            root.path("store/adopted/target"),
+            "workspaces/adopted/target",
+        );
+
+        let mut remover = start_remover(&store);
+        match remover
+            .empty(stale, no_usage(), &policy, &now)
+            .expect("the store is fine")
+        {
+            Outcome::Emptied { emptying, .. } => assert_eq!(
+                (emptying.entry.name, emptying.idle, emptying.signal),
+                (
+                    stale.clone(),
+                    Duration::from_secs(45 * DAY),
+                    ActivitySignal::LastBuilt
+                )
+            ),
+            outcome => panic!("the stale entry came to {outcome:?}"),
+        }
+        match remover
+            .empty(used, no_usage(), &policy, &now)
+            .expect("the store is fine")
+        {
+            Outcome::Kept { reason, .. } => assert_eq!(reason, KeepReason::Live),
+            outcome => panic!("the entry that was used again came to {outcome:?}"),
+        }
+        // Neither is what it was listed as, so each is left for the next run.
+        let orphaned_outcome = remover.empty(orphaned, no_usage(), &policy, &now);
+        let adopted_outcome = remover.remove(&removals[0], no_usage(), &policy, &now);
+        for outcome in [orphaned_outcome, adopted_outcome] {
+            match outcome.expect("the store is fine") {
+                Outcome::InUse {
+                    reason: InUse::LinksChanged,
+                    ..
+                } => {}
+                outcome => panic!("an entry whose links changed came to {outcome:?}"),
+            }
+        }
+
+        assert_eq!(
+            names_in(&root.path("store/stale")),
+            ["target", "target-dir-metadata.json"]
+        );
+        assert_eq!(names_in(&root.path("store/stale/target")), [""; 0]);
+        assert_eq!(
+            inode_of(&root.path("store/stale/target")),
+            stale_target_inode,
+            "the target directory itself is never moved"
+        );
+        assert!(stale_link.is_dir() && adopted_link.is_dir());
+        assert!(outside_file.is_file(), "a symlink is not followed");
+        for name in ["orphaned", "used", "adopted"] {
+            assert_eq!(
+                names_in(&root.path(&format!("store/{name}/target"))),
+                contents,
+                "`{name}` is untouched"
+            );
+        }
+        assert_eq!(names_in(&root.path("store").join(TRASH_DIR_NAME)), [""; 0]);
+        // Free again, or this would block.
+        store
+            .lock()
+            .expect("locked store")
+            .unlock()
+            .expect("unlocked");
+    }
+
+    #[test]
+    fn test_permit_moves_the_contents_into_the_trash() {
+        let root = TestRoot::new();
+        let backlink = write_live(&root, "entry");
+        root.write_file("store/entry/target/debug/deps/built-file", 1);
+        root.write_file("store/entry/target/.rustc_info.json", 1);
+        let store = test_store(&root);
+        let name = EntryName::new("entry");
+        let policy = max_age_policy();
+        let trash = TrashDir::open(&store).expect("opened trash");
+        let mut names = TrashNames::new(now(), 4242);
+
+        let lock = store.lock().expect("locked store");
+        let permit = match recheck(&lock, &name, &policy, &now).expect("rechecked") {
+            Recheck::Empty(permit) => permit,
+            recheck => panic!("the second look came to {recheck:?}"),
+        };
+        let trashed = permit
+            .move_to_trash(&trash, &mut names)
+            .expect("moved the contents");
+        lock.unlock().expect("unlocked");
+
+        // A run that dies here leaves this: the target directory is empty, and the link works.
+        assert!(trashed.left_behind.is_none(), "{trashed:?}");
+        assert_eq!(
+            names_in(&root.path("store/entry")),
+            ["target", "target-dir-metadata.json"]
+        );
+        assert_eq!(names_in(&root.path("store/entry/target")), [""; 0]);
+        assert!(backlink.is_dir());
+        assert_eq!(names_in(&trash.path), slice::from_ref(&trashed.trash_name));
+        assert_eq!(
+            names_in(&trash.path.join(&trashed.trash_name)),
+            [".rustc_info.json", "debug"]
+        );
+        assert_eq!(
+            recheck_left_with(&store, &name, &policy),
+            Left::Kept(KeepReason::LiveAlreadyEmpty),
+            "the next run has nothing to empty"
+        );
+
+        let emptying = trashed.delete(&trash).expect("deleted the contents");
+        assert_eq!(emptying.entry.name, name);
+        assert_eq!(names_in(&trash.path), [""; 0]);
+    }
+
+    #[test]
+    fn test_emptying_leaves_what_it_cannot_move() {
+        let root = TestRoot::new();
+        let backlink = write_live(&root, "entry");
+        root.write_file("store/entry/target/a-file", 1);
+        root.write_file("store/entry/target/tmp/file", 1);
+        root.write_file("store/entry/target/z-dir/file", 1);
+        let stuck_file = root.write_file("store/entry/target/zz-read-only/file", 1);
+        let store = test_store(&root);
+        let name = EntryName::new("entry");
+        let policy = max_age_policy();
+        let mut remover = start_remover(&store);
+        // Nothing can be moved out of a directory without write permission on it.
+        let target = root.path("store/entry/target");
+        let Some(read_only_target) = ReadOnlyDir::new(target.clone()) else {
+            return;
+        };
+        let outcome = remover.empty(&name, no_usage(), &policy, &now);
+        match outcome.expect("the store is fine") {
+            Outcome::EmptyFailed { error, .. } => assert_eq!(
+                error.to_string(),
+                format!(
+                    "could not move `{target}/a-file`: Permission denied (os error 13) \
+                     (and 3 other paths); nothing was deleted"
+                )
+            ),
+            outcome => panic!("the entry came to {outcome:?}"),
+        }
+        assert_eq!(
+            names_in(&target),
+            ["a-file", "tmp", "z-dir", "zz-read-only"]
+        );
+        drop(read_only_target);
+
+        // A directory can't be moved to another parent without write permission on it.
+        let stuck_dir = root.path("store/entry/target/zz-read-only");
+        let Some(read_only) = ReadOnlyDir::new(stuck_dir.clone()) else {
+            return;
+        };
+
+        let outcome = remover.empty(&name, no_usage(), &policy, &now);
+        match outcome.expect("the store is fine") {
+            Outcome::EmptyFailed { error, .. } => assert_eq!(
+                error.to_string(),
+                format!(
+                    "could not move `{stuck_dir}`: Permission denied (os error 13) \
+                     (and 1 other path); the rest of the target directory was deleted"
+                )
+            ),
+            outcome => panic!("the entry came to {outcome:?}"),
+        }
+        // `tmp` stays too: a test built in what was left behind would fail without it.
+        assert_eq!(names_in(&target), ["tmp", "zz-read-only"]);
+        assert!(stuck_file.is_file() && backlink.is_dir());
+        assert_eq!(names_in(&root.path("store").join(TRASH_DIR_NAME)), [""; 0]);
+
+        // The next run finishes the job, once whatever was in the way is gone.
+        drop(read_only);
+        match remover
+            .empty(&name, no_usage(), &policy, &now)
+            .expect("the store is fine")
+        {
+            Outcome::Emptied { .. } => {}
+            outcome => panic!("the entry came to {outcome:?}"),
+        }
+        assert_eq!(names_in(&root.path("store/entry/target")), [""; 0]);
+        assert!(backlink.is_dir());
     }
 
     #[test]

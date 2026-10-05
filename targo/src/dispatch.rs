@@ -45,7 +45,7 @@ pub enum TargoCommand {
     },
     /// Remove the store entries that no workspace links to any more.
     Gc {
-        /// Report what would be removed, and change nothing.
+        /// Report what would be removed or emptied, and change nothing.
         #[arg(long)]
         dry_run: bool,
 
@@ -58,7 +58,31 @@ pub enum TargoCommand {
             value_parser = humantime::parse_duration,
         )]
         orphan_grace: Duration,
+
+        /// Also empty the target directory of an entry that a workspace still links to, once
+        /// it has not been used or built in for this long. If unset, such entries are left alone.
+        #[arg(
+            long,
+            value_name = "DURATION",
+            env = MAX_AGE_ENV,
+            value_parser = parse_max_age,
+        )]
+        max_age: Option<Duration>,
     },
+}
+
+/// The environment variable that sets `--max-age` for `targo gc`.
+const MAX_AGE_ENV: &str = "TARGO_GC_MAX_AGE";
+
+/// Parses a maximum age. A bare `0` is refused: it reads as "off", and would empty everything.
+fn parse_max_age(value: &str) -> Result<Duration, String> {
+    if value == "0" {
+        return Err(format!(
+            "`0` needs a time unit: `0s` empties every entry that is not being built in; \
+             to empty none, leave `--max-age` and `{MAX_AGE_ENV}` unset"
+        ));
+    }
+    humantime::parse_duration(value).map_err(|error| error.to_string())
 }
 
 impl TargoApp {
@@ -70,13 +94,18 @@ impl TargoApp {
             TargoCommand::Gc {
                 dry_run,
                 orphan_grace,
+                max_age,
             } => {
                 let mode = if dry_run {
                     GcMode::DryRun
                 } else {
                     GcMode::Remove
                 };
-                exec_gc(mode, GcPolicy { orphan_grace })
+                let policy = GcPolicy {
+                    orphan_grace,
+                    max_age,
+                };
+                exec_gc(mode, policy)
             }
         }
     }
@@ -677,6 +706,8 @@ mod tests {
                 TargoCommand::Gc {
                     dry_run,
                     orphan_grace,
+                    // Not given here, so it is whatever the environment of the test sets.
+                    max_age: _,
                 } => {
                     assert_eq!(
                         (dry_run, orphan_grace),
@@ -688,8 +719,32 @@ mod tests {
             }
         }
 
+        let max_age_data = [
+            ("--max-age 30d", 30 * 24 * 60 * 60),
+            ("--dry-run --max-age=90m", 90 * 60),
+            ("--max-age 0s --orphan-grace 1d", 0),
+        ];
+        for (input, expected_secs) in max_age_data {
+            let app = parse(input).unwrap_or_else(|error| panic!("for {input:?}: {error}"));
+            match app.command {
+                TargoCommand::Gc { max_age, .. } => {
+                    assert_eq!(
+                        max_age,
+                        Some(Duration::from_secs(expected_secs)),
+                        "for {input:?}"
+                    );
+                }
+                TargoCommand::WrapCargo { .. } => panic!("for {input:?}, clap parsed wrap-cargo"),
+            }
+        }
+
         let error_data = [
             ("--orphan-grace soon", ErrorKind::ValueValidation),
+            ("--max-age soon", ErrorKind::ValueValidation),
+            ("--max-age 30", ErrorKind::ValueValidation),
+            // `humantime` takes a bare `0` as zero, which would empty every entry.
+            ("--max-age 0", ErrorKind::ValueValidation),
+            ("--max-age", ErrorKind::InvalidValue),
             // A number needs a unit.
             ("--dry-run --orphan-grace 1", ErrorKind::ValueValidation),
             ("--dry-run=yes", ErrorKind::TooManyValues),

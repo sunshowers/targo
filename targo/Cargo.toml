@@ -9,7 +9,7 @@ atomicwrites = "0.4.3"
 camino = { version = "1.1.9", features = ["serde1"] }
 cap-std = { version = "4.0.3", features = ["fs_utf8"] }
 chrono = { version = "0.4.38", features = ["serde"] }
-clap = { version = "4.5.16", features = ["derive"] }
+clap = { version = "4.5.16", features = ["derive", "env"] }
 color-eyre = { version = "0.6.3", default-features = false }
 fs2 = "0.4.3"
 home = "0.5.9"

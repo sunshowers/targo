@@ -293,6 +293,12 @@ impl UnlockedStore {
         Ok(DirWithPath::new(entry_dir, self.entry_path(name)))
     }
 
+    /// Opens the directory that backlinks to the entry `name` point at.
+    pub(crate) fn open_entry_target_dir(&self, name: &EntryName) -> io::Result<DirWithPath> {
+        let target_dir = self.open_entry_dir(name)?.dir().open_dir("target")?;
+        Ok(DirWithPath::new(target_dir, self.entry_target_path(name)))
+    }
+
     fn read_entry(&self, name: OsString) -> StoreEntry {
         let name = match name.into_string() {
             Ok(name) => EntryName(name),

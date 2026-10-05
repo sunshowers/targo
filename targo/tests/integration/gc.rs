@@ -867,6 +867,584 @@ fn gc_honors_orphan_grace() {
     assert!(!entry.exists());
 }
 
+/// A store with live entries of every age, and what gc makes of it with a maximum age of 2 days.
+struct MaxAgeScenario {
+    store: TestStore,
+    /// The entries that gc empties, in order, each with the reason that gc gives.
+    emptyings: Vec<(Utf8PathBuf, String)>,
+    /// The only entry that gc removes, with the reason that gc gives.
+    orphan: (Utf8PathBuf, String),
+    /// The lines for entries that are kept, after the verb.
+    kept_lines: Vec<String>,
+    /// The live entries that gc leaves as they are.
+    untouched_live: Vec<Utf8PathBuf>,
+}
+
+impl MaxAgeScenario {
+    const MAX_AGE: [&'static str; 2] = ["--max-age", "2d"];
+
+    fn new(env: &TestEnv) -> Self {
+        let store = TestStore::new(env);
+        let outside_file = env.root().join("outside-file");
+        fs::write(&outside_file, "").expect("wrote file");
+
+        // Everything in the target directory goes, whatever made it.
+        let (stale, stale_link) = store.create_live_entry(env, "stale", -(60 * DAY + 12 * HOUR));
+        fs::create_dir_all(stale.join("target/debug/deps")).expect("created dir");
+        fs::create_dir_all(stale.join("target/rust-analyzer/flycheck0")).expect("created dir");
+        write_synced(
+            &stale.join("target/debug/deps/built-file"),
+            &[b'x'; 64 * 1024],
+        );
+        write_synced(&stale.join("target/rust-analyzer/flycheck0/file"), b"x");
+        write_synced(&stale.join("target/CACHEDIR.TAG"), b"x");
+        write_synced(&stale.join("target/.rustc_info.json"), b"{}");
+        symlink(&outside_file, stale.join("target/link")).expect("created symlink");
+        store.create_build_dir(
+            &stale,
+            "target/debug",
+            OutputLayout::Deps,
+            -(45 * DAY + 12 * HOUR),
+        );
+
+        // The oldest, so it is emptied first even though its name sorts last.
+        let (unbuilt, unbuilt_link) =
+            store.create_live_entry(env, "unbuilt", -(90 * DAY + 12 * HOUR));
+        fs::create_dir(unbuilt.join("target/doc")).expect("created dir");
+        write_synced(&unbuilt.join("target/doc/index.html"), b"x");
+
+        let (fresh, _) = store.create_live_entry(env, "fresh", -HOUR);
+        write_synced(&fresh.join("target/built-file"), b"x");
+        let (built_recently, _) = store.create_live_entry(env, "built-recently", -400 * DAY);
+        store.create_build_dir(
+            &built_recently,
+            "target/debug",
+            OutputLayout::Units,
+            -(HOUR + HOUR / 2),
+        );
+        let (already_empty, _) = store.create_live_entry(env, "already-empty", -400 * DAY);
+
+        let gone_link = env.root().join("workspaces/gone/target");
+        let orphan = store.create_entry("orphan", &[&gone_link], -(8 * DAY + 12 * HOUR));
+        write_synced(&orphan.join("target/built-file"), b"x");
+        // Past the maximum age, which is for live entries only.
+        let recent_orphan =
+            store.create_entry("recent-orphan", &[&gone_link], -(3 * DAY + 12 * HOUR));
+        write_synced(&recent_orphan.join("target/built-file"), b"x");
+
+        let looping_link = env.root().join("workspaces/looping/target");
+        let unknown = store.create_entry("unknown", &[&looping_link], -400 * DAY);
+        write_synced(&unknown.join("target/built-file"), b"x");
+        create_symlink(Utf8Path::new("target"), &looping_link);
+        let loop_error =
+            fs::metadata(&looping_link).expect_err("a looping symlink doesn't resolve");
+
+        let no_metadata = store.dir.join("no-metadata");
+        fs::create_dir_all(no_metadata.join("target")).expect("created dir");
+        write_synced(&no_metadata.join("target/built-file"), b"x");
+
+        Self {
+            store,
+            emptyings: vec![
+                (
+                    unbuilt,
+                    format!("live, last used 90d ago; backlinks: `{unbuilt_link}` (live)"),
+                ),
+                (
+                    stale,
+                    format!("live, last built 45d ago; backlinks: `{stale_link}` (live)"),
+                ),
+            ],
+            orphan: (
+                orphan,
+                format!("orphaned, last used 8d ago; backlinks: `{gone_link}` (missing)"),
+            ),
+            kept_lines: vec![
+                "`no-metadata`: unrecognized; it has no `target-dir-metadata.json`".to_owned(),
+                format!(
+                    "`unknown`: backlink state unknown; backlinks: `{looping_link}` \
+                     (unknown: {loop_error})"
+                ),
+            ],
+            untouched_live: vec![fresh, built_recently, already_empty],
+        }
+    }
+
+    /// The report of a run with the maximum age, with the verbs of a dry run or of a real one.
+    fn report(&self, [remove, empty, keep]: [&str; 3], [and_empty, and_keep]: [&str; 2]) -> String {
+        let mut emptied_lines = String::new();
+        let mut emptied_size = 0;
+        for (dir, reason) in &self.emptyings {
+            let name = dir.file_name().expect("entry has a name");
+            let size = contents_usage(&dir.join("target"));
+            emptied_size += size;
+            emptied_lines.push_str(&format!(
+                "{empty} `{name}` ({}): {reason}\n",
+                human_size(size)
+            ));
+        }
+        let (orphan_dir, orphan_reason) = &self.orphan;
+        let orphan_size = human_size(disk_usage(orphan_dir));
+        let kept_lines: String = self
+            .kept_lines
+            .iter()
+            .map(|line| format!("{keep} {line}\n"))
+            .collect();
+        format!(
+            "{emptied_lines}{remove} `orphan` ({orphan_size}): {orphan_reason}\n{kept_lines}\
+             {remove} 1 entry ({orphan_size}), {and_empty} 2 entries ({}), and {and_keep} \
+             6 entries: 2 live, 1 already empty, 1 orphaned within grace, \
+             1 with unknown backlinks, 1 unrecognized\n",
+            human_size(emptied_size)
+        )
+    }
+}
+
+#[test]
+fn gc_empties_stale_live_entries_and_touches_nothing_else() {
+    let env = TestEnv::new();
+    let scenario = MaxAgeScenario::new(&env);
+    let store_dir = &scenario.store.dir;
+    let expected = scenario.report(["removed", "emptied", "kept"], ["emptied", "kept"]);
+    let emptied_targets: Vec<_> = scenario
+        .emptyings
+        .iter()
+        .map(|(dir, _)| dir.join("target"))
+        .collect();
+
+    let before = env.snapshot();
+    let output = run_gc(&env, &MaxAgeScenario::MAX_AGE);
+    assert_eq!(stdout_of_success(&output), expected);
+
+    // What is in the target directories is gone, and so is the orphan. The entries, their
+    // metadata, and the target directories themselves stay.
+    let mut expected = before;
+    expected.retain(|path, _| {
+        let in_emptied_target = emptied_targets
+            .iter()
+            .any(|target| path.starts_with(target) && path != target);
+        !in_emptied_target && !path.starts_with(&scenario.orphan.0)
+    });
+    let mut after = env.snapshot();
+    // Taking things out of a directory changes when it was modified.
+    for snapshot in [&mut expected, &mut after] {
+        for dir in emptied_targets.iter().chain([store_dir]) {
+            match snapshot.remove(dir) {
+                Some(Entry::Dir(_)) => {}
+                entry => panic!("`{dir}` is {entry:?}"),
+            }
+        }
+    }
+    match after.remove(&store_dir.join("gc.lock")) {
+        Some(Entry::File(_, contents)) => assert_eq!(contents, ""),
+        entry => panic!("the gc lock is {entry:?}"),
+    }
+    match after.remove(&store_dir.join(".targo-trash")) {
+        Some(Entry::Dir(_)) => {}
+        entry => panic!("the trash is {entry:?}"),
+    }
+    assert_eq!(
+        after, expected,
+        "only the contents and the orphan are gone, and the trash is empty"
+    );
+    for (dir, _) in &scenario.emptyings {
+        let name = dir.file_name().expect("entry has a name");
+        let link = env.root().join("workspaces").join(name).join("target");
+        assert!(
+            link.is_symlink() && link.is_dir() && names_in(&link).is_empty(),
+            "the link of `{name}` leads to its empty target directory"
+        );
+    }
+
+    // What was emptied is still live and old, and a second run leaves it alone.
+    let output = run_gc(&env, &MaxAgeScenario::MAX_AGE);
+    assert_eq!(
+        stdout_of_success(&output),
+        format!(
+            "{}removed 0 entries (0 B), emptied 0 entries (0 B), and kept 8 entries: 2 live, \
+             3 already empty, 1 orphaned within grace, 1 with unknown backlinks, \
+             1 unrecognized\n",
+            scenario
+                .kept_lines
+                .iter()
+                .map(|line| format!("kept {line}\n"))
+                .collect::<String>(),
+        )
+    );
+}
+
+#[test]
+fn gc_dry_run_reports_what_it_would_empty_and_changes_nothing() {
+    let env = TestEnv::new();
+    let scenario = MaxAgeScenario::new(&env);
+    let expected = scenario.report(
+        ["would remove", "would empty", "would keep"],
+        ["empty", "keep"],
+    );
+
+    let before = env.snapshot();
+    let output = run_dry_gc(&env, &MaxAgeScenario::MAX_AGE);
+    assert_eq!(stdout_of_success(&output), expected);
+    assert_eq!(env.snapshot(), before, "a dry run changes nothing");
+}
+
+#[test]
+fn gc_empties_nothing_without_a_maximum_age() {
+    let env = TestEnv::new();
+    let scenario = MaxAgeScenario::new(&env);
+    let (orphan_dir, orphan_reason) = &scenario.orphan;
+    let orphan_size = human_size(disk_usage(orphan_dir));
+    let report = |[remove, keep, and_keep]: [&str; 3]| {
+        let kept_lines: String = scenario
+            .kept_lines
+            .iter()
+            .map(|line| format!("{keep} {line}\n"))
+            .collect();
+        format!(
+            "{remove} `orphan` ({orphan_size}): {orphan_reason}\n{kept_lines}\
+             {remove} 1 entry ({orphan_size}) and {and_keep} 8 entries: 5 live, \
+             1 orphaned within grace, 1 with unknown backlinks, 1 unrecognized\n"
+        )
+    };
+    let dry_report = report(["would remove", "would keep", "keep"]);
+    let real_report = report(["removed", "kept", "kept"]);
+
+    let before = env.snapshot();
+    assert_eq!(stdout_of_success(&run_dry_gc(&env, &[])), dry_report);
+    assert_eq!(stdout_of_success(&run_gc(&env, &[])), real_report);
+    let after = env.snapshot();
+    let live_dirs = scenario.emptyings.iter().map(|(dir, _)| dir);
+    for dir in live_dirs.chain(&scenario.untouched_live) {
+        let (before, after) = (subtree(&before, dir), subtree(&after, dir));
+        assert!(
+            !before.is_empty() && after == before,
+            "`{dir}` is untouched"
+        );
+    }
+}
+
+#[test]
+fn gc_takes_the_maximum_age_from_the_environment() {
+    let env = TestEnv::new();
+    let store = TestStore::new(&env);
+    let (entry, link) = store.create_live_entry(&env, "entry", -(60 * DAY + 12 * HOUR));
+    write_synced(&entry.join("target/built-file"), b"x");
+    let size = human_size(contents_usage(&entry.join("target")));
+    let run = |max_age_env: Option<&str>, args: &[&str]| {
+        let mut targo = env.targo();
+        if let Some(max_age) = max_age_env {
+            targo.env("TARGO_GC_MAX_AGE", max_age);
+        }
+        targo.arg("gc").args(args).output().expect("ran targo")
+    };
+
+    let orphans_only = "would remove 0 entries (0 B) and keep 1 entry: 1 live\n".to_owned();
+    let kept = "would remove 0 entries (0 B), empty 0 entries (0 B), and keep 1 entry: 1 live\n"
+        .to_owned();
+    let emptied = format!(
+        "would empty `entry` ({size}): live, last used 60d ago; backlinks: `{link}` (live)\n\
+         would remove 0 entries (0 B), empty 1 entry ({size}), and keep 0 entries\n"
+    );
+    // Each case is the variable, the arguments, and the report of a dry run.
+    let data: [(Option<&str>, &[&str], &String); 6] = [
+        (None, &[], &orphans_only),
+        (Some("30d"), &[], &emptied),
+        (Some("90d"), &[], &kept),
+        // The argument wins.
+        (Some("90d"), &["--max-age", "30d"], &emptied),
+        (Some("30d"), &["--max-age", "90d"], &kept),
+        (None, &["--max-age", "30d"], &emptied),
+    ];
+    let before = env.snapshot();
+    for (max_age_env, args, expected) in data {
+        let output = run(max_age_env, &[&["--dry-run"], args].concat());
+        assert_eq!(
+            &stdout_of_success(&output),
+            expected,
+            "for {max_age_env:?} and {args:?}"
+        );
+    }
+
+    // A value that is no duration is an error, not a run without a maximum age.
+    let zero_problem = "`0` needs a time unit: `0s` empties every entry that is not being built \
+                        in; to empty none, leave `--max-age` and `TARGO_GC_MAX_AGE` unset";
+    let problems = [
+        ("", "value was empty"),
+        ("soon", "expected number at 0"),
+        // It reads as "off", and as a duration it would empty every entry.
+        ("0", zero_problem),
+    ];
+    for (value, problem) in problems {
+        for mode_args in MODE_ARGS {
+            let output = run(Some(value), mode_args);
+            assert_eq!(
+                (
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stdout).as_ref(),
+                    String::from_utf8_lossy(&output.stderr).as_ref()
+                ),
+                (
+                    Some(2),
+                    "",
+                    format!(
+                        "error: invalid value '{value}' for '--max-age <DURATION>': {problem}\n\n\
+                         For more information, try '--help'.\n"
+                    )
+                    .as_str()
+                ),
+                "for {value:?} and {mode_args:?}"
+            );
+        }
+    }
+    assert_eq!(env.snapshot(), before, "nothing is changed");
+
+    let output = run(Some("30d"), &[]);
+    assert_eq!(
+        stdout_of_success(&output),
+        format!(
+            "emptied `entry` ({size}): live, last used 60d ago; backlinks: `{link}` (live)\n\
+             removed 0 entries (0 B), emptied 1 entry ({size}), and kept 0 entries\n"
+        )
+    );
+    assert_eq!(names_in(&entry.join("target")), [""; 0]);
+}
+
+#[test]
+fn gc_skips_a_live_entry_that_cargo_is_building_in() {
+    let env = TestEnv::new();
+    let store = TestStore::new(&env);
+    let (entry, link) = store.create_live_entry(&env, "entry", -(60 * DAY + 12 * HOUR));
+    let lock_path = create_cargo_lock(&entry, "target/debug");
+    write_synced(&entry.join("target/debug/built-file"), b"x");
+    let size = human_size(contents_usage(&entry.join("target")));
+    let max_age = ["--max-age", "30d"];
+
+    // As Cargo holds it for the length of a build.
+    let cargo_lock = fs::File::open(&lock_path).expect("opened Cargo's lock");
+    FileExt::lock_exclusive(&cargo_lock).expect("locked as Cargo does");
+    let before = env.snapshot();
+    assert_eq!(
+        stdout_of_success(&run_gc(&env, &max_age)),
+        format!(
+            "skipped `entry`: in use, Cargo holds the lock at `{lock_path}`\n\
+             removed 0 entries (0 B), emptied 0 entries (0 B), and kept 1 entry: 1 in use\n"
+        )
+    );
+    let after = env.snapshot();
+    let (before, after) = (subtree(&before, &entry), subtree(&after, &entry));
+    assert!(
+        !before.is_empty() && after == before,
+        "the entry is untouched"
+    );
+
+    drop(cargo_lock);
+    assert_eq!(
+        stdout_of_success(&run_gc(&env, &max_age)),
+        format!(
+            "emptied `entry` ({size}): live, last used 60d ago; backlinks: `{link}` (live)\n\
+             removed 0 entries (0 B), emptied 1 entry ({size}), and kept 0 entries\n"
+        )
+    );
+    assert_eq!(names_in(&entry.join("target")), [""; 0]);
+}
+
+#[test]
+fn gc_finishes_an_emptying_that_was_interrupted() {
+    let env = TestEnv::new();
+    let store = TestStore::new(&env);
+    let (entry, link) = store.create_live_entry(&env, "entry", -(60 * DAY + 12 * HOUR));
+    // As a run leaves things if it dies after moving `debug` and before moving `release`.
+    let moved = store.dir.join(".targo-trash/interrupted");
+    fs::create_dir_all(moved.join("debug")).expect("created leftover");
+    write_synced(&moved.join("debug/built-file"), &[b'x'; 64 * 1024]);
+    fs::create_dir(entry.join("target/release")).expect("created dir");
+    write_synced(&entry.join("target/release/built-file"), b"x");
+    let moved_size = human_size(disk_usage(&moved));
+    let size = human_size(contents_usage(&entry.join("target")));
+    assert!(link.is_dir(), "the link leads to the target directory");
+
+    assert_eq!(
+        stdout_of_success(&run_gc(&env, &["--max-age", "30d"])),
+        format!(
+            "removed leftover `interrupted` ({moved_size}) from an earlier run\n\
+             emptied `entry` ({size}): live, last used 60d ago; backlinks: `{link}` (live)\n\
+             removed 0 entries (0 B), emptied 1 entry ({size}), and kept 0 entries\n"
+        )
+    );
+    assert_eq!(names_in(&store.dir.join(".targo-trash")), [""; 0]);
+    assert_eq!(names_in(&entry), ["target", "target-dir-metadata.json"]);
+    assert!(link.is_dir() && names_in(&link).is_empty());
+}
+
+#[test]
+fn gc_reports_an_entry_that_it_cannot_empty_and_carries_on() {
+    let env = TestEnv::new();
+    let store = TestStore::new(&env);
+    // The older one, so it comes first.
+    let (stuck, _) = store.create_live_entry(&env, "stuck", -(90 * DAY + 12 * HOUR));
+    let (fine, fine_link) = store.create_live_entry(&env, "fine", -(60 * DAY + 12 * HOUR));
+    write_synced(&fine.join("target/built-file"), b"x");
+    let fine_size = human_size(contents_usage(&fine.join("target")));
+    write_synced(&stuck.join("target/built-file"), b"x");
+    let stuck_dir = stuck.join("target/read-only");
+    fs::create_dir(&stuck_dir).expect("created dir");
+    write_synced(&stuck_dir.join("file"), b"");
+    // A directory can't be moved to another parent without write permission on it.
+    let Some(_read_only) = ReadOnlyDirs::new(&env, &stuck_dir) else {
+        return;
+    };
+
+    let output = run_gc(&env, &["--max-age", "30d"]);
+    assert_eq!(
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).as_ref(),
+            String::from_utf8_lossy(&output.stderr).as_ref()
+        ),
+        (
+            Some(1),
+            format!(
+                "emptied `fine` ({fine_size}): live, last used 60d ago; \
+                 backlinks: `{fine_link}` (live)\n\
+                 removed 0 entries (0 B), emptied 1 entry ({fine_size}), \
+                 failed to empty 1 entry, and kept 0 entries\n"
+            )
+            .as_str(),
+            format!(
+                "failed to empty `stuck`: could not move `{stuck_dir}`: Permission denied \
+                 (os error 13); the rest of the target directory was deleted\n"
+            )
+            .as_str()
+        )
+    );
+    assert_eq!(names_in(&stuck.join("target")), ["read-only"]);
+    assert_eq!(names_in(&stuck_dir), ["file"]);
+    assert_eq!(names_in(&store.dir.join(".targo-trash")), [""; 0]);
+}
+
+#[test]
+fn gc_reports_contents_that_it_cannot_delete_and_tries_again() {
+    let env = TestEnv::new();
+    let store = TestStore::new(&env);
+    let trash = store.dir.join(".targo-trash");
+    let (entry, link) = store.create_live_entry(&env, "entry", -(60 * DAY + 12 * HOUR));
+    let stuck_dir = entry.join("target/debug/read-only");
+    fs::create_dir_all(&stuck_dir).expect("created dir");
+    write_synced(&stuck_dir.join("file"), b"");
+    // `debug` can be moved, but nothing can be removed from the directory in it.
+    let Some(read_only) = ReadOnlyDirs::new(&env, &stuck_dir) else {
+        return;
+    };
+    let max_age = ["--max-age", "30d"];
+
+    let output = run_gc(&env, &max_age);
+    let trash_names = names_in(&trash);
+    let [trash_name] = trash_names.as_slice() else {
+        panic!("the trash has {trash_names:?} in it");
+    };
+    let left_dir = trash.join(trash_name);
+    assert_eq!(
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).as_ref(),
+            String::from_utf8_lossy(&output.stderr).as_ref()
+        ),
+        (
+            Some(1),
+            "removed 0 entries (0 B), emptied 0 entries (0 B), failed to empty 1 entry, \
+             and kept 0 entries\n",
+            format!(
+                "failed to empty `entry`: could not delete `{left_dir}/debug/read-only/file`: \
+                 Permission denied (os error 13); what is left is in `{left_dir}`, where the \
+                 next gc run tries again\n"
+            )
+            .as_str()
+        )
+    );
+    assert!(link.is_dir() && names_in(&link).is_empty());
+    assert_eq!(names_in(&left_dir.join("debug")), ["read-only"]);
+
+    drop(read_only);
+    let stdout = stdout_of_success(&run_gc(&env, &max_age));
+    assert!(
+        stdout.starts_with(&format!("removed leftover `{trash_name}` ("))
+            && stdout.ends_with(
+                ") from an earlier run\nremoved 0 entries (0 B), emptied 0 entries (0 B), \
+                 and kept 1 entry: 1 already empty\n"
+            ),
+        "stdout was:\n{stdout}"
+    );
+    assert_eq!(names_in(&trash), [""; 0]);
+}
+
+#[test]
+fn cargo_rebuilds_in_an_entry_that_gc_emptied() {
+    let env = TestEnv::new();
+    let workspace_dir = env.create_workspace("workspace");
+    let link = workspace_dir.join("target");
+    let check = |mut command: Command, args: &[&str]| {
+        let output = command
+            .current_dir(&workspace_dir)
+            .args(args)
+            .output()
+            .expect("ran the command");
+        assert!(
+            output.status.success(),
+            "{args:?} exited with {}, stderr was:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let assert_emptied = |when: &str| {
+        // The age and the size depend on timing and on the filesystem.
+        let stdout = stdout_of_success(&run_gc(&env, &["--max-age", "0s"]));
+        assert!(
+            stdout.starts_with("emptied `")
+                && stdout.contains("): live, last ")
+                && stdout.ends_with("), and kept 0 entries\n"),
+            "{when}, stdout was:\n{stdout}"
+        );
+        assert!(
+            link.is_symlink() && link.is_dir() && names_in(&link).is_empty(),
+            "{when}, the link leads to an empty target directory"
+        );
+    };
+
+    check(env.targo(), &["wrap-cargo", "check", "--offline"]);
+    let link_dest = link.read_link_utf8().expect("target is a symlink");
+    assert!(names_in(&link).contains(&"debug".to_owned()));
+    assert_emptied("after a check through targo");
+
+    // As rust-analyzer and scripts run it: Cargo itself, through the link.
+    check(env.cargo(), &["check", "--offline"]);
+    assert!(names_in(&link).contains(&"debug".to_owned()));
+    // With a last use long ago, only that build shows that the entry is in use.
+    let entry = link_dest.parent().expect("the link leads into an entry");
+    let metadata_path = entry.join("target-dir-metadata.json");
+    let metadata = fs::read_to_string(&metadata_path).expect("read metadata");
+    let mut metadata: serde_json::Value = serde_json::from_str(&metadata).expect("parsed metadata");
+    metadata["last-used"] = "2020-01-01T00:00:00+00:00".into();
+    write_synced(&metadata_path, metadata.to_string().as_bytes());
+    assert_eq!(
+        stdout_of_success(&run_gc(&env, &["--max-age", "1h"])),
+        "removed 0 entries (0 B), emptied 0 entries (0 B), and kept 1 entry: 1 live\n",
+        "an emptied entry that Cargo alone built in again is not emptied again"
+    );
+    assert_emptied("after a check with Cargo alone");
+
+    check(env.targo(), &["wrap-cargo", "check", "--offline"]);
+    assert!(names_in(&link).contains(&"debug".to_owned()));
+    assert_eq!(
+        link.read_link_utf8().expect("target is a symlink"),
+        link_dest,
+        "the link is kept as it was"
+    );
+    assert_eq!(
+        stdout_of_success(&run_gc(&env, &["--max-age", "1h"])),
+        "removed 0 entries (0 B), emptied 0 entries (0 B), and kept 1 entry: 1 live\n"
+    );
+}
+
 #[test]
 fn gc_dry_run_follows_the_link_that_wrap_cargo_makes() {
     let env = TestEnv::new();
@@ -1131,6 +1709,19 @@ impl TestStore {
         output.set_modified(built).expect("set modification time");
     }
 
+    /// Creates an entry that a workspace links to, and returns its directory and the link.
+    fn create_live_entry(
+        &self,
+        env: &TestEnv,
+        name: &str,
+        last_used_secs: i64,
+    ) -> (Utf8PathBuf, Utf8PathBuf) {
+        let link = env.root().join("workspaces").join(name).join("target");
+        let entry_dir = self.create_entry(name, &[&link], last_used_secs);
+        create_symlink(&entry_dir.join("target"), &link);
+        (entry_dir, link)
+    }
+
     /// Creates an entry last used `last_used_secs` after the store was created.
     ///
     /// Half a unit away from a whole one, the age shown can't depend on how long the test takes.
@@ -1293,6 +1884,11 @@ fn disk_usage(path: &Utf8Path) -> u64 {
         }
     }
     bytes
+}
+
+/// The disk usage of what is in `dir`, which is a tree that has no hard links in it.
+fn contents_usage(dir: &Utf8Path) -> u64 {
+    disk_usage(dir) - dir.symlink_metadata().expect("read metadata").blocks() * 512
 }
 
 /// Formats a size as targo does. Only for multiples of 512 bytes below 1 MiB.

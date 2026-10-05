@@ -7,7 +7,7 @@ use crate::{
     store::{EntryName, StoreEntry, UnlockedStore, UnrecognizedDir},
 };
 use camino::{Utf8Path, Utf8PathBuf};
-use cap_std::fs::{Dir, Metadata, MetadataExt as _};
+use cap_std::fs::{Dir, DirEntry, Metadata, MetadataExt as _};
 use chrono::{DateTime, Utc};
 use color_eyre::{eyre::WrapErr, Report, Result};
 use std::{
@@ -126,8 +126,7 @@ pub(crate) fn run(
     for entry in store.entries()? {
         match entry {
             StoreEntry::Recognized { name, metadata } => {
-                let build_activity = BuildActivity::read(&store, &name);
-                let entry = classify(&store, name, metadata, build_activity);
+                let entry = examine(&store, name, metadata, now, policy);
                 match decide(&entry, now, policy) {
                     Decision::RemoveOrphan { idle, signal } => removals.push(Removal {
                         entry,
@@ -510,6 +509,18 @@ impl Liveness {
 /// The lock file that Cargo holds while it builds in a directory.
 const CARGO_LOCK_NAME: &str = ".cargo-lock";
 
+/// Where rustc's outputs go in a build directory, up to Cargo 1.99.
+const OLD_OUTPUT_DIR_NAME: &str = "deps";
+
+/// Where each unit's fingerprint directory is, up to Cargo 1.99.
+const OLD_FINGERPRINTS_DIR_NAME: &str = ".fingerprint";
+
+/// Since Cargo 1.100, each unit has its own `build/<package>/<unit>` directory.
+const UNITS_DIR_NAME: &str = "build";
+
+/// In a unit's directory: rustc's outputs, and the unit's fingerprint.
+const UNIT_DIR_NAMES: [&str; 2] = ["out", "fingerprint"];
+
 /// A directory that Cargo builds in, which is one with a `.cargo-lock` in it.
 #[derive(Debug)]
 struct BuildDir {
@@ -530,58 +541,121 @@ impl BuildDir {
         }
     }
 
-    /// When the `deps` directory last changed, which it does whenever anything is compiled.
-    fn deps_modified(&self) -> Result<Option<DateTime<Utc>>, PathError> {
-        let path_error = |error| PathError {
-            path: self.path.join("deps"),
-            error,
-        };
-        match self.dir.symlink_metadata("deps") {
-            Ok(metadata) if metadata.is_dir() => {
-                let modified = metadata.modified().map_err(path_error)?;
-                Ok(Some(modified.into_std().into()))
-            }
-            Ok(_) => Ok(None),
-            Err(error) if is_absent(&error) => Ok(None),
-            Err(error) => Err(path_error(error)),
+    /// Newest mtime of the directories that a compile changes. A failed compile changes only
+    /// the unit's fingerprint directory, so that is read too.
+    fn last_built(&self) -> Result<Option<DateTime<Utc>>, PathError> {
+        let mut newest = dir_modified(&self.dir, &self.path, OLD_OUTPUT_DIR_NAME)?;
+        if let Some((dir, path)) = open_subdir(&self.dir, &self.path, OLD_FINGERPRINTS_DIR_NAME)? {
+            for_each_subdir_entry(&dir, &path, &mut |_, metadata, unit_path| {
+                newest = newest.max(Some(modified(metadata, unit_path)?));
+                Ok(())
+            })?;
         }
+        if let Some((dir, path)) = open_subdir(&self.dir, &self.path, UNITS_DIR_NAME)? {
+            for_each_subdir(&dir, &path, &mut |package_dir, package_path| {
+                for_each_subdir(&package_dir, &package_path, &mut |unit_dir, unit_path| {
+                    for name in UNIT_DIR_NAMES {
+                        newest = newest.max(dir_modified(&unit_dir, &unit_path, name)?);
+                    }
+                    Ok(())
+                })
+            })?;
+        }
+        Ok(newest)
     }
 }
 
-/// Finds the build directories of an entry, which are at `target/*` and `target/*/*`.
-///
-/// `entry_path` is only for naming paths in errors.
+/// Opens the directory `name` in `dir`, if there is one. `dir_path` only names error paths.
+fn open_subdir(
+    dir: &Dir,
+    dir_path: &Path,
+    name: &str,
+) -> Result<Option<(Dir, PathBuf)>, PathError> {
+    let path = dir_path.join(name);
+    match dir.open_dir(name) {
+        Ok(subdir) => Ok(Some((subdir, path))),
+        Err(error) if is_absent(&error) => Ok(None),
+        Err(error) => Err(PathError { path, error }),
+    }
+}
+
+/// Mtime of the directory `name` in `dir`; `dir_path` only names error paths.
+fn dir_modified(
+    dir: &Dir,
+    dir_path: &Path,
+    name: &str,
+) -> Result<Option<DateTime<Utc>>, PathError> {
+    match dir.symlink_metadata(name) {
+        Ok(metadata) if metadata.is_dir() => modified(&metadata, dir_path.join(name)).map(Some),
+        Ok(_) => Ok(None),
+        Err(error) if is_absent(&error) => Ok(None),
+        Err(error) => Err(PathError {
+            path: dir_path.join(name),
+            error,
+        }),
+    }
+}
+
+fn modified(metadata: &Metadata, path: PathBuf) -> Result<DateTime<Utc>, PathError> {
+    match mtime_to_utc(metadata.mtime(), metadata.mtime_nsec()) {
+        Some(modified) => Ok(modified),
+        None => Err(PathError {
+            path,
+            error: io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the modification time is out of range",
+            ),
+        }),
+    }
+}
+
+/// `None` for a time that chrono can't represent, which a filesystem can hold.
+fn mtime_to_utc(secs: i64, nanos: i64) -> Option<DateTime<Utc>> {
+    DateTime::from_timestamp(secs, u32::try_from(nanos).ok()?)
+}
+
+/// Finds an entry's build directories: `target/*`, `target/*/*`, and the same inside a
+/// tool's own target directory under `target`. `entry_path` only names error paths.
 fn find_build_dirs(entry_dir: &Dir, entry_path: &Path) -> Result<Vec<BuildDir>, PathError> {
-    let target_path = entry_path.join("target");
-    let target_dir = match entry_dir.open_dir("target") {
-        Ok(target_dir) => target_dir,
-        Err(error) if is_absent(&error) => return Ok(Vec::new()),
-        Err(error) => {
-            return Err(PathError {
-                path: target_path,
-                error,
-            })
-        }
+    let Some((target_dir, target_path)) = open_subdir(entry_dir, entry_path, "target")? else {
+        return Ok(Vec::new());
     };
 
     let mut build_dirs = Vec::new();
     for_each_subdir(&target_dir, &target_path, &mut |outer_dir, outer_path| {
         // With `--target`, the profile directories are one level down.
-        for_each_subdir(&outer_dir, &outer_path, &mut |inner_dir, inner_path| {
-            build_dirs.extend(BuildDir::new(inner_dir, inner_path)?);
-            Ok(())
-        })?;
+        let found_before = build_dirs.len();
+        add_build_dirs_in(&outer_dir, &outer_path, &mut build_dirs)?;
+        // This may be a tool's target directory, such as `target/rust-analyzer`, where
+        // `--target` puts build directories another level down.
+        if build_dirs.len() > found_before {
+            for_each_subdir(&outer_dir, &outer_path, &mut |inner_dir, inner_path| {
+                add_build_dirs_in(&inner_dir, &inner_path, &mut build_dirs)
+            })?;
+        }
         build_dirs.extend(BuildDir::new(outer_dir, outer_path)?);
         Ok(())
     })?;
     Ok(build_dirs)
 }
 
-/// Opens each real directory in `dir` in turn. One at a time, since there can be thousands.
-fn for_each_subdir(
+/// Adds the build directories that are directly in `dir`.
+fn add_build_dirs_in(
     dir: &Dir,
     path: &Path,
-    visit: &mut dyn FnMut(Dir, PathBuf) -> Result<(), PathError>,
+    build_dirs: &mut Vec<BuildDir>,
+) -> Result<(), PathError> {
+    for_each_subdir(dir, path, &mut |subdir, subdir_path| {
+        build_dirs.extend(BuildDir::new(subdir, subdir_path)?);
+        Ok(())
+    })
+}
+
+/// Visits each real directory in `dir`, without opening it.
+fn for_each_subdir_entry(
+    dir: &Dir,
+    path: &Path,
+    visit: &mut dyn FnMut(&DirEntry, &Metadata, PathBuf) -> Result<(), PathError>,
 ) -> Result<(), PathError> {
     let path_error = |error| PathError {
         path: path.to_owned(),
@@ -591,13 +665,9 @@ fn for_each_subdir(
         let dir_entry = dir_entry.map_err(path_error)?;
         let subdir_path = path.join(dir_entry.file_name());
         // Not followed, so a symlink to a directory is passed over.
-        let subdir = match dir_entry.metadata() {
-            Ok(metadata) if metadata.is_dir() => dir_entry.open_dir(),
-            Ok(_) => continue,
-            Err(error) => Err(error),
-        };
-        match subdir {
-            Ok(subdir) => visit(subdir, subdir_path)?,
+        match dir_entry.metadata() {
+            Ok(metadata) if metadata.is_dir() => visit(&dir_entry, &metadata, subdir_path)?,
+            Ok(_) => {}
             Err(error) => {
                 return Err(PathError {
                     path: subdir_path,
@@ -609,12 +679,32 @@ fn for_each_subdir(
     Ok(())
 }
 
-/// When Cargo last built in an entry, going by its `deps` directories.
-///
+/// Opens each real directory in `dir` in turn. One at a time, since there can be thousands.
+fn for_each_subdir(
+    dir: &Dir,
+    path: &Path,
+    visit: &mut dyn FnMut(Dir, PathBuf) -> Result<(), PathError>,
+) -> Result<(), PathError> {
+    for_each_subdir_entry(
+        dir,
+        path,
+        &mut |dir_entry, _, subdir_path| match dir_entry.open_dir() {
+            Ok(subdir) => visit(subdir, subdir_path),
+            Err(error) => Err(PathError {
+                path: subdir_path,
+                error,
+            }),
+        },
+    )
+}
+
+/// When Cargo last built in an entry, going by the directories that a compile changes.
 /// Unlike `last-used`, this also shows builds that didn't go through targo.
 #[derive(Debug)]
 enum BuildActivity {
-    /// No build directory has a `deps` directory.
+    /// Not looked for, since the backlinks or `last-used` already keep the entry.
+    NotNeeded,
+    /// No build directory shows a compile.
     None,
     Last(DateTime<Utc>),
     /// The entry could not be examined, so there may have been a build just now.
@@ -641,9 +731,9 @@ impl BuildActivity {
     fn of(build_dirs: &[BuildDir]) -> Self {
         let mut newest = None;
         for build_dir in build_dirs {
-            match build_dir.deps_modified() {
+            match build_dir.last_built() {
                 // `None` is less than any time.
-                Ok(modified) => newest = newest.max(modified),
+                Ok(built) => newest = newest.max(built),
                 Err(error) => return Self::Unknown(error),
             }
         }
@@ -657,6 +747,7 @@ impl BuildActivity {
 impl fmt::Display for BuildActivity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NotNeeded => f.write_str("the build directories were not examined"),
             Self::None => f.write_str("nothing was built"),
             Self::Last(built) => write!(f, "last built at {built}"),
             Self::Unknown(error) => write!(f, "could not examine {error}"),
@@ -703,12 +794,31 @@ fn classify(
     }
 }
 
+/// Classifies an entry, looking at its builds only if the decision depends on them.
+fn examine(
+    store: &UnlockedStore,
+    name: EntryName,
+    metadata: TargetDirMetadata,
+    now: DateTime<Utc>,
+    policy: &GcPolicy,
+) -> RecognizedEntry {
+    let mut entry = classify(store, name, metadata, BuildActivity::NotNeeded);
+    match decide_without_builds(&entry, now, policy) {
+        Preliminary::Keep(_) => {}
+        // Slow for a large entry, so only done for an entry that would otherwise go.
+        Preliminary::UnusedOrphan { .. } => {
+            entry.build_activity = BuildActivity::read(store, &entry.name);
+        }
+    }
+    entry
+}
+
 /// Which of an entry's timestamps is its last activity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ActivitySignal {
     /// `last-used` in the metadata, which only targo updates.
     LastUsed,
-    /// The newest change to a `deps` directory.
+    /// The newest change that a compile made in a build directory.
     LastBuilt,
 }
 
@@ -761,43 +871,63 @@ fn time_since(now: DateTime<Utc>, at: DateTime<Utc>) -> Result<Duration, Duratio
     })
 }
 
-/// Decides what to do with `entry` at the time `now`.
-fn decide(entry: &RecognizedEntry, now: DateTime<Utc>, policy: &GcPolicy) -> Decision {
+/// What an entry's backlinks and `last-used` come to, before its builds are looked at.
+#[derive(Debug)]
+enum Preliminary {
+    Keep(KeepReason),
+    /// An orphan last used `unused` ago, past the grace period; only a build can keep it.
+    UnusedOrphan {
+        unused: Duration,
+    },
+}
+
+fn decide_without_builds(
+    entry: &RecognizedEntry,
+    now: DateTime<Utc>,
+    policy: &GcPolicy,
+) -> Preliminary {
     let reason = match entry.liveness() {
         Liveness::Live => KeepReason::Live,
         Liveness::Unknown => KeepReason::UnknownBacklinks,
-        Liveness::Orphaned => {
-            let last_built = match &entry.build_activity {
-                BuildActivity::Unknown(_) => {
-                    return Decision::Keep(KeepReason::UnknownBuildActivity)
-                }
-                BuildActivity::None => None,
-                BuildActivity::Last(last_built) => Some(*last_built),
-            };
-            let (last_activity, signal) = match last_built {
-                Some(last_built) if last_built > entry.last_used => {
-                    (last_built, ActivitySignal::LastBuilt)
-                }
-                Some(_) | None => (entry.last_used, ActivitySignal::LastUsed),
-            };
-            match time_since(now, last_activity) {
-                Ok(idle) if idle >= policy.orphan_grace => {
-                    return Decision::RemoveOrphan { idle, signal };
-                }
-                Ok(idle) => match (signal, time_since(now, entry.last_used)) {
-                    // Without the build, the entry would be removed.
-                    (ActivitySignal::LastBuilt, Ok(unused)) if unused >= policy.orphan_grace => {
-                        KeepReason::OrphanBuiltWithinGrace { idle }
-                    }
-                    (ActivitySignal::LastBuilt | ActivitySignal::LastUsed, Ok(_) | Err(_)) => {
-                        KeepReason::OrphanWithinGrace
-                    }
-                },
-                Err(ahead) => KeepReason::ActivityInFuture { ahead, signal },
+        Liveness::Orphaned => match time_since(now, entry.last_used) {
+            Ok(unused) if unused >= policy.orphan_grace => {
+                return Preliminary::UnusedOrphan { unused };
             }
+            Ok(_) => KeepReason::OrphanWithinGrace,
+            Err(ahead) => KeepReason::ActivityInFuture {
+                ahead,
+                signal: ActivitySignal::LastUsed,
+            },
+        },
+    };
+    Preliminary::Keep(reason)
+}
+
+/// Decides what to do with `entry` at the time `now`.
+fn decide(entry: &RecognizedEntry, now: DateTime<Utc>, policy: &GcPolicy) -> Decision {
+    let unused = match decide_without_builds(entry, now, policy) {
+        Preliminary::Keep(reason) => return Decision::Keep(reason),
+        Preliminary::UnusedOrphan { unused } => unused,
+    };
+    let last_built = match &entry.build_activity {
+        // Without a look at the builds, there may have been one just now.
+        BuildActivity::NotNeeded | BuildActivity::Unknown(_) => {
+            return Decision::Keep(KeepReason::UnknownBuildActivity);
+        }
+        BuildActivity::Last(last_built) if *last_built > entry.last_used => *last_built,
+        BuildActivity::None | BuildActivity::Last(_) => {
+            return Decision::RemoveOrphan {
+                idle: unused,
+                signal: ActivitySignal::LastUsed,
+            };
         }
     };
-    Decision::Keep(reason)
+    let signal = ActivitySignal::LastBuilt;
+    match time_since(now, last_built) {
+        Ok(idle) if idle >= policy.orphan_grace => Decision::RemoveOrphan { idle, signal },
+        Ok(idle) => Decision::Keep(KeepReason::OrphanBuiltWithinGrace { idle }),
+        Err(ahead) => Decision::Keep(KeepReason::ActivityInFuture { ahead, signal }),
+    }
 }
 
 /// An I/O error, and the path that it happened at.
@@ -1576,6 +1706,65 @@ mod tests {
                 recognized_built(vec![unknown()], ago(DAY), unknown_activity()),
                 Decision::Keep(KeepReason::UnknownBacklinks),
             ),
+            // Where the last use alone keeps the entry, its builds don't matter.
+            (
+                DAY,
+                recognized_built(
+                    vec![BacklinkState::Missing],
+                    ago(DAY - 1),
+                    unknown_activity(),
+                ),
+                Decision::Keep(KeepReason::OrphanWithinGrace),
+            ),
+            (
+                DAY,
+                built_orphan(ago(60), ahead(60)),
+                Decision::Keep(KeepReason::OrphanWithinGrace),
+            ),
+            (
+                DAY,
+                built_orphan(ahead(60), ahead(120)),
+                Decision::Keep(KeepReason::ActivityInFuture {
+                    ahead: Duration::from_secs(60),
+                    signal: ActivitySignal::LastUsed,
+                }),
+            ),
+            (
+                DAY,
+                recognized_built(vec![BacklinkState::Missing], ahead(60), unknown_activity()),
+                Decision::Keep(KeepReason::ActivityInFuture {
+                    ahead: Duration::from_secs(60),
+                    signal: ActivitySignal::LastUsed,
+                }),
+            ),
+            (
+                DAY,
+                recognized_built(
+                    vec![BacklinkState::Missing],
+                    ago(DAY - 1),
+                    BuildActivity::NotNeeded,
+                ),
+                Decision::Keep(KeepReason::OrphanWithinGrace),
+            ),
+            (
+                DAY,
+                recognized_built(
+                    vec![BacklinkState::Live],
+                    ago(DAY),
+                    BuildActivity::NotNeeded,
+                ),
+                Decision::Keep(KeepReason::Live),
+            ),
+            // An entry is never removed without a look at its builds.
+            (
+                DAY,
+                recognized_built(
+                    vec![BacklinkState::Missing],
+                    ago(DAY),
+                    BuildActivity::NotNeeded,
+                ),
+                Decision::Keep(KeepReason::UnknownBuildActivity),
+            ),
         ];
         for (grace_secs, entry, expected) in data {
             let policy = GcPolicy {
@@ -1863,23 +2052,30 @@ mod tests {
         }
     }
 
+    fn read_build_activity(entry: &Utf8Path) -> (Vec<PathBuf>, BuildActivity) {
+        let entry_dir = Dir::open_ambient_dir(entry, ambient_authority()).expect("opened");
+        let build_dirs = find_build_dirs(&entry_dir, entry.as_std_path());
+        let build_dirs = build_dirs.expect("found build dirs");
+        let mut paths: Vec<_> = build_dirs.iter().map(|dir| dir.path.clone()).collect();
+        paths.sort();
+        (paths, BuildActivity::of(&build_dirs))
+    }
+
+    fn assert_last_built(entry: &Utf8Path, expected: Option<DateTime<Utc>>, when: &str) {
+        match read_build_activity(entry).1 {
+            BuildActivity::None => assert_eq!(None, expected, "{when}"),
+            BuildActivity::Last(built) => assert_eq!(Some(built), expected, "{when}"),
+            BuildActivity::Unknown(error) => panic!("{when}, the activity is unknown: {error}"),
+            BuildActivity::NotNeeded => panic!("{when}, the activity was not looked for"),
+        }
+    }
+
     #[test]
     fn test_build_activity() {
         let root = TestRoot::new();
         let entry = root.create_dir("store/entry");
-        let read = || {
-            let entry_dir = Dir::open_ambient_dir(&entry, ambient_authority()).expect("opened");
-            let build_dirs = find_build_dirs(&entry_dir, entry.as_std_path());
-            let build_dirs = build_dirs.expect("found build dirs");
-            let mut paths: Vec<_> = build_dirs.iter().map(|dir| dir.path.clone()).collect();
-            paths.sort();
-            (paths, BuildActivity::of(&build_dirs))
-        };
-        let assert_activity = |expected: Option<DateTime<Utc>>, when: &str| match read().1 {
-            BuildActivity::None => assert_eq!(None, expected, "{when}"),
-            BuildActivity::Last(built) => assert_eq!(Some(built), expected, "{when}"),
-            BuildActivity::Unknown(error) => panic!("{when}, the activity is unknown: {error}"),
-        };
+        let read = || read_build_activity(&entry);
+        let assert_activity = |expected, when: &str| assert_last_built(&entry, expected, when);
         let build_dir = |relative: &str| {
             root.write_file(&format!("store/entry/{relative}/.cargo-lock"), 0);
             let deps = root.create_dir(&format!("store/entry/{relative}/deps"));
@@ -1894,11 +2090,16 @@ mod tests {
         root.create_dir("store/entry/target");
         assert_activity(None, "with an empty target directory");
 
-        // None of these is a `deps` directory next to a `.cargo-lock` at depth 1 or 2.
+        // None of these is a `deps` directory in a build directory that gc finds.
         set_modified(&root.create_dir("store/entry/target/doc/deps"), newer);
         set_modified(&root.create_dir("store/entry/target/deps"), newer);
         set_modified(&root.create_dir("store/entry/target/a/b/c/deps"), newer);
         root.write_file("store/entry/target/a/b/c/.cargo-lock", 0);
+        set_modified(
+            &root.create_dir("store/entry/target/tool/a/b/c/deps"),
+            newer,
+        );
+        root.write_file("store/entry/target/tool/a/b/c/.cargo-lock", 0);
         root.write_file("store/entry/target/.cargo-lock", 0);
         root.write_file("store/entry/target/no-deps/.cargo-lock", 0);
         root.write_file("store/entry/target/file-deps/.cargo-lock", 0);
@@ -1911,41 +2112,241 @@ mod tests {
 
         let set_debug = build_dir("target/debug");
         let set_triple_release = build_dir("target/x86_64-unknown-linux-gnu/release");
+        let set_tool_debug = build_dir("target/tool/debug");
+        let set_tool_triple_debug = build_dir("target/tool/x86_64-unknown-linux-gnu/debug");
         let build_dir_paths: Vec<_> = [
             "target/debug",
             "target/file-deps",
             "target/no-deps",
+            "target/tool/debug",
+            "target/tool/x86_64-unknown-linux-gnu/debug",
             "target/x86_64-unknown-linux-gnu/release",
         ]
         .map(|relative| entry.join(relative).into_std_path_buf())
         .into();
         assert_eq!(read().0, build_dir_paths);
 
-        // The newest counts, at either depth.
+        // The newest counts, at any depth.
         set_debug(old);
         set_triple_release(older);
+        set_tool_debug(older);
+        set_tool_triple_debug(older);
         assert_activity(Some(old), "with the newest at depth 1");
         set_triple_release(new);
         assert_activity(Some(new), "with the newest at depth 2");
+        set_tool_triple_debug(newer);
+        assert_activity(Some(newer), "with the newest at depth 3");
+    }
+
+    #[test]
+    fn test_build_activity_of_units() {
+        let root = TestRoot::new();
+        let entry = root.create_dir("store/entry");
+        let assert_activity = |expected, when: &str| assert_last_built(&entry, expected, when);
+        let dir = |relative: &str| root.create_dir(&format!("store/entry/target/{relative}"));
+        let file = |relative: &str| root.write_file(&format!("store/entry/target/{relative}"), 0);
+        let old = utc("2026-03-01T12:00:00Z");
+        let new = utc("2026-03-08T12:00:00Z");
+        let newest = utc("2026-04-01T12:00:00Z");
+
+        file("debug/.cargo-lock");
+        file("thumbv7em-none-eabi/release/.cargo-lock");
+        assert_activity(None, "with empty build directories");
+
+        // gc dates a build by none of these; `serde-0f0f/out` is as Cargo 1.99 has it.
+        let not_outputs = [
+            "debug",
+            "debug/.fingerprint",
+            "debug/build",
+            "debug/build/serde",
+            "debug/build/serde/0f0f",
+            "debug/build/serde/0f0f/run",
+            "debug/build/serde-0f0f/out",
+            "debug/build/no-output/a1a1",
+            "debug/build/link-output/b2b2",
+            "debug/incremental/serde-c3c3",
+            "doc/build/serde/0f0f/out",
+            "doc/.fingerprint/serde-0f0f",
+        ]
+        .map(dir);
+        file("debug/.fingerprint/file");
+        file("debug/build/file");
+        file("debug/build/serde/file");
+        file("debug/build/file-output/d4d4/out");
+        file("debug/build/file-output/d4d4/fingerprint");
+        for link in ["out", "fingerprint"] {
+            root.symlink(
+                root.path("store/entry/target/debug/build/serde/0f0f/run"),
+                &format!("store/entry/target/debug/build/link-output/b2b2/{link}"),
+            );
+        }
+        root.symlink(
+            root.path("store/entry/target/doc/build/serde"),
+            "store/entry/target/debug/build/link-package",
+        );
+        root.symlink(
+            root.path("store/entry/target/doc/.fingerprint/serde-0f0f"),
+            "store/entry/target/debug/.fingerprint/link-unit",
+        );
+        let set_not_outputs = || {
+            for not_output in &not_outputs {
+                set_modified(not_output, newest);
+            }
+        };
+        set_not_outputs();
+        assert_activity(None, "without an output directory");
+
+        let outputs = [
+            ("debug/deps", "in the output directory of Cargo 1.99"),
+            (
+                "debug/.fingerprint/serde-0f0f",
+                "in a fingerprint directory of Cargo 1.99",
+            ),
+            ("debug/build/serde/0f0f/out", "in a unit"),
+            (
+                "debug/build/serde/0f0f/fingerprint",
+                "in the fingerprint directory of a unit",
+            ),
+            (
+                "debug/build/serde/e5e5/out",
+                "in another unit of the package",
+            ),
+            ("debug/build/syn/f6f6/out", "in a unit of another package"),
+            (
+                "thumbv7em-none-eabi/release/build/serde/0f0f/out",
+                "in a unit at depth 2",
+            ),
+        ]
+        .map(|(relative, place)| (dir(relative), place));
+        set_modified(&dir("debug/build/serde/0f0f/out/nested"), newest);
+        set_not_outputs();
+        for (output, _) in &outputs {
+            set_modified(output, old);
+        }
+        assert_activity(
+            Some(old),
+            "with every output directory as old as the others",
+        );
+
+        for (output, place) in &outputs {
+            set_modified(output, new);
+            assert_activity(Some(new), &format!("with the newest {place}"));
+            set_modified(output, old);
+        }
     }
 
     #[test]
     fn test_build_activity_unknown() {
-        let root = TestRoot::new();
-        root.write_file("store/entry/target/debug/.cargo-lock", 0);
-        root.create_dir("store/entry/target/debug/deps");
-        let store = test_store(&root);
-        let locked = root.path("store/entry/target/debug");
-        let Some(_locked) = LockedDir::new(locked.clone()) else {
-            return;
+        let read_error = |root: &TestRoot, when: &str| {
+            let store = test_store(root);
+            match BuildActivity::read(&store, &EntryName::new("entry")) {
+                BuildActivity::Unknown(error) => error,
+                activity @ (BuildActivity::NotNeeded
+                | BuildActivity::None
+                | BuildActivity::Last(_)) => panic!("{when}, the activity is {activity:?}"),
+            }
         };
 
-        match BuildActivity::read(&store, &EntryName::new("entry")) {
-            BuildActivity::Unknown(error) => assert_eq!(
-                (error.path, error.error.kind()),
-                (locked.into(), io::ErrorKind::PermissionDenied)
-            ),
-            activity => panic!("the activity is {activity:?}"),
+        for name in ["build", ".fingerprint"] {
+            let root = TestRoot::new();
+            root.write_file("store/entry/target/debug/.cargo-lock", 0);
+            let looping = root.symlink(name, &format!("store/entry/target/debug/{name}"));
+            let error = read_error(&root, &format!("with a `{name}` that is a looping symlink"));
+            assert_eq!(error.path, looping.into_std_path_buf());
+        }
+
+        let data = [
+            "target",
+            "target/debug",
+            "target/debug/build",
+            "target/debug/build/serde",
+            "target/debug/build/serde/0f0f",
+        ];
+        for locked in data {
+            let root = TestRoot::new();
+            root.write_file("store/entry/target/debug/.cargo-lock", 0);
+            root.create_dir("store/entry/target/debug/deps");
+            root.create_dir("store/entry/target/debug/build/serde/0f0f/out");
+            let locked_path = root.path(&format!("store/entry/{locked}"));
+            let Some(_locked) = LockedDir::new(locked_path.clone()) else {
+                return;
+            };
+
+            let when = format!("with `{locked}` locked");
+            let error = read_error(&root, &when);
+            // The directory itself or a name in it, depending on the platform.
+            assert!(
+                error.path.starts_with(&locked_path),
+                "{when}, the error is at `{}`",
+                error.path.display()
+            );
+            assert_eq!(
+                error.error.kind(),
+                io::ErrorKind::PermissionDenied,
+                "{when}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_mtime_to_utc() {
+        assert_eq!(
+            mtime_to_utc(1_772_996_400, 500),
+            Some(utc("2026-03-08T19:00:00.0000005Z"))
+        );
+        assert_eq!(
+            mtime_to_utc(-1, 0),
+            Some(utc("1969-12-31T23:59:59Z")),
+            "before the epoch"
+        );
+        for (secs, nanos) in [
+            (9_999_999_999_999, 0),
+            (i64::MAX, 0),
+            (i64::MIN, 0),
+            (0, -1),
+        ] {
+            assert_eq!(mtime_to_utc(secs, nanos), None, "for {secs}s and {nanos}ns");
+        }
+    }
+
+    #[test]
+    fn test_examine_looks_at_builds_only_where_they_decide() {
+        const DAY: u64 = 24 * 60 * 60;
+        let now = utc("2026-03-08T19:00:00Z");
+        let ago = |secs: u64| now - Duration::from_secs(secs);
+        let policy = GcPolicy {
+            orphan_grace: Duration::from_secs(7 * DAY),
+        };
+        let built = ago(3600);
+        let root = TestRoot::new();
+        let store = test_store(&root);
+        let live_link = root.symlink(root.path("store/live/target"), "workspaces/live/target");
+        let gone_link = root.path("workspaces/gone/target");
+
+        let data = [
+            ("live", &live_link, ago(30 * DAY), None),
+            ("recent", &gone_link, ago(7 * DAY - 1), None),
+            ("future", &gone_link, now + Duration::from_secs(DAY), None),
+            ("unused", &gone_link, ago(7 * DAY), Some(built)),
+        ];
+        for (name, backlink, last_used, expected) in data {
+            root.write_file(&format!("store/{name}/target/debug/.cargo-lock"), 0);
+            let deps = root.create_dir(&format!("store/{name}/target/debug/deps"));
+            set_modified(&deps, built);
+            let metadata = TargetDirMetadata {
+                backlinks: [backlink.clone()].into(),
+                last_used: last_used.into(),
+            };
+
+            let entry = examine(&store, EntryName::new(name), metadata, now, &policy);
+            let looked_at = match entry.build_activity {
+                BuildActivity::NotNeeded => None,
+                BuildActivity::Last(built) => Some(built),
+                activity @ (BuildActivity::None | BuildActivity::Unknown(_)) => {
+                    panic!("for `{name}`, the activity is {activity:?}")
+                }
+            };
+            assert_eq!(looked_at, expected, "for `{name}`");
         }
     }
 

@@ -10,7 +10,7 @@ use std::{
         fs::{symlink, MetadataExt, PermissionsExt},
         net::{UnixListener, UnixStream},
     },
-    process::{Output, Stdio},
+    process::{Command, Output, Stdio},
     sync::mpsc,
     thread,
     time::SystemTime,
@@ -61,17 +61,28 @@ impl Scenario {
 
         // The builds are newer than the last use, at either depth, so they give the age.
         let built = store.create_entry("built-long-ago", &[&gone_link], -(60 * DAY + 12 * HOUR));
-        store.create_build_dir(&built, "target/debug", -(30 * DAY + 12 * HOUR));
+        store.create_build_dir(
+            &built,
+            "target/debug",
+            OutputLayout::Deps,
+            -(30 * DAY + 12 * HOUR),
+        );
         store.create_build_dir(
             &built,
             "target/x86_64-unknown-linux-gnu/release",
+            OutputLayout::Units,
             -(20 * DAY + 12 * HOUR),
         );
 
         let no_backlinks = store.create_entry("no-backlinks", &[], -(7 * DAY + 12 * HOUR));
         store.create_entry("recent-orphan", &[&gone_link], -HOUR);
         let recently_built = store.create_entry("recently-built", &[&gone_link], -400 * DAY);
-        store.create_build_dir(&recently_built, "target/debug", -(HOUR + HOUR / 2));
+        store.create_build_dir(
+            &recently_built,
+            "target/debug",
+            OutputLayout::Deps,
+            -(HOUR + HOUR / 2),
+        );
         store.create_entry("future", &[&gone_link], 2 * DAY + 12 * HOUR);
 
         let looping_link = workspaces.join("looping/target");
@@ -380,6 +391,154 @@ fn assert_gc_skips_an_entry_while_cargo_runs(cargo_subcommand: &str) {
         "stdout was:\n{stdout}"
     );
     assert!(!entry.exists());
+}
+
+/// Which Cargo a test builds with.
+#[derive(Clone, Copy, Debug)]
+enum TestCargo {
+    /// The Cargo that built the tests.
+    Own,
+    /// The Cargo of a rustup toolchain, which may not be installed.
+    Rustup(&'static str),
+}
+
+impl TestCargo {
+    fn command(self, env: &TestEnv) -> Command {
+        match self {
+            Self::Own => env.cargo(),
+            Self::Rustup(toolchain) => {
+                let mut command = env.confined_command("rustup");
+                // `CARGO` names the tests' own Cargo, not this toolchain's.
+                command
+                    .env_remove("CARGO")
+                    .args(["run", toolchain, "cargo"]);
+                command
+            }
+        }
+    }
+}
+
+/// Whether the source compiles when a test checks it again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Compile {
+    Succeeds,
+    Fails,
+}
+
+impl Compile {
+    fn source(self) -> &'static str {
+        match self {
+            Self::Succeeds => "pub fn changed() {}\n",
+            Self::Fails => "pub fn broken() -> u32 { \"no\" }\n",
+        }
+    }
+}
+
+#[test]
+fn gc_dates_an_entry_by_a_real_cargo_check() {
+    assert_gc_dates_an_entry_by_a_cargo_check(TestCargo::Own, Compile::Succeeds);
+}
+
+#[test]
+fn gc_dates_an_entry_by_a_real_cargo_check_that_fails() {
+    assert_gc_dates_an_entry_by_a_cargo_check(TestCargo::Own, Compile::Fails);
+}
+
+#[test]
+#[ignore = "needs the stable toolchain of rustup"]
+fn gc_dates_an_entry_by_checks_with_stable_cargo() {
+    for second in [Compile::Succeeds, Compile::Fails] {
+        assert_gc_dates_an_entry_by_a_cargo_check(TestCargo::Rustup("stable"), second);
+    }
+}
+
+#[test]
+#[ignore = "needs the beta toolchain of rustup"]
+fn gc_dates_an_entry_by_checks_with_beta_cargo() {
+    for second in [Compile::Succeeds, Compile::Fails] {
+        assert_gc_dates_an_entry_by_a_cargo_check(TestCargo::Rustup("beta"), second);
+    }
+}
+
+fn assert_gc_dates_an_entry_by_a_cargo_check(cargo: TestCargo, second: Compile) {
+    let env = TestEnv::new();
+    let store = TestStore::new(&env);
+    let gone_link = env.root().join("workspaces/gone/target");
+    let entry = store.create_entry("entry", &[&gone_link], -400 * DAY);
+    let workspace_dir = env.create_workspace("workspace");
+    let check = |expected: Compile| {
+        let output = cargo
+            .command(&env)
+            .current_dir(&workspace_dir)
+            .env("CARGO_TARGET_DIR", entry.join("target"))
+            .args(["check", "--offline"])
+            .output()
+            .expect("ran cargo");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Any failure other than the source's type error is neither.
+        let compile = if output.status.success() {
+            Some(Compile::Succeeds)
+        } else if stderr.contains("error[E0308]") {
+            Some(Compile::Fails)
+        } else {
+            None
+        };
+        assert_eq!(
+            compile,
+            Some(expected),
+            "for {cargo:?}, cargo exited with {}, stderr was:\n{stderr}",
+            output.status
+        );
+    };
+    let kept = |age: &str| {
+        format!(
+            "would keep `entry`: orphaned, last built {age} ago; \
+             backlinks: `{gone_link}` (missing)\n\
+             would remove 0 entries (0 B) and keep 1 entry: 1 orphaned within grace\n"
+        )
+    };
+
+    check(Compile::Succeeds);
+    // Backdated, so that only what the next check changes is recent.
+    let long_ago = store.now - TimeDelta::seconds(30 * DAY + 12 * HOUR);
+    set_dir_times(&entry.join("target"), SystemTime::from(long_ago));
+    assert_eq!(
+        stdout_of_success(&run_dry_gc(&env, &["--orphan-grace", "40d"])),
+        kept("30d")
+    );
+
+    let mut source =
+        fs::File::create(workspace_dir.join("src/lib.rs")).expect("opened source file");
+    source
+        .write_all(second.source().as_bytes())
+        .expect("wrote source file");
+    // Newer than the first check, whatever the filesystem's timestamp granularity.
+    source
+        .set_modified(SystemTime::from(store.now + TimeDelta::seconds(HOUR)))
+        .expect("set modification time");
+    check(second);
+    // The age shown depends on timing, so only the text around it is compared.
+    let stdout = stdout_of_success(&run_dry_gc(&env, &["--orphan-grace", "1h"]));
+    let kept_recently = kept("AGE");
+    let (before_age, after_age) = kept_recently
+        .split_once("AGE")
+        .expect("the line has an age");
+    assert!(
+        stdout.starts_with(before_age) && stdout.ends_with(after_age),
+        "stdout was:\n{stdout}"
+    );
+}
+
+/// Sets the modification time of `dir` and of every directory under it.
+fn set_dir_times(dir: &Utf8Path, modified: SystemTime) {
+    for entry in dir.read_dir_utf8().expect("read dir") {
+        let path = entry.expect("read dir entry").into_path();
+        if path.symlink_metadata().expect("read metadata").is_dir() {
+            set_dir_times(&path, modified);
+        }
+    }
+    let dir = fs::File::open(dir).expect("opened dir");
+    dir.set_modified(modified).expect("set modification time");
 }
 
 #[test]
@@ -925,6 +1084,15 @@ struct TestStore {
     now: DateTime<Utc>,
 }
 
+/// Where rustc's outputs go in a build directory.
+#[derive(Clone, Copy, Debug)]
+enum OutputLayout {
+    /// In `deps`, as Cargo has it up to 1.99.
+    Deps,
+    /// In a directory for each unit, as Cargo has it since 1.100.
+    Units,
+}
+
 impl TestStore {
     fn new(env: &TestEnv) -> Self {
         let dir = env.store_dir();
@@ -944,13 +1112,23 @@ impl TestStore {
 
     /// Creates a build directory in an entry, last built `built_secs` after the store was
     /// created.
-    fn create_build_dir(&self, entry_dir: &Utf8Path, build_dir: &str, built_secs: i64) {
+    fn create_build_dir(
+        &self,
+        entry_dir: &Utf8Path,
+        build_dir: &str,
+        layout: OutputLayout,
+        built_secs: i64,
+    ) {
         create_cargo_lock(entry_dir, build_dir);
-        let deps = entry_dir.join(build_dir).join("deps");
-        fs::create_dir(&deps).expect("created deps dir");
+        let output = match layout {
+            OutputLayout::Deps => "deps",
+            OutputLayout::Units => "build/package/0f0f0f0f0f0f0f0f/out",
+        };
+        let output = entry_dir.join(build_dir).join(output);
+        fs::create_dir_all(&output).expect("created output dir");
         let built = SystemTime::from(self.now + TimeDelta::seconds(built_secs));
-        let deps = fs::File::open(&deps).expect("opened deps dir");
-        deps.set_modified(built).expect("set modification time");
+        let output = fs::File::open(&output).expect("opened output dir");
+        output.set_modified(built).expect("set modification time");
     }
 
     /// Creates an entry last used `last_used_secs` after the store was created.

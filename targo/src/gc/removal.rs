@@ -525,6 +525,7 @@ fn ignore_not_found(result: io::Result<()>) -> io::Result<()> {
 mod tests {
     use super::{
         super::{
+            examine,
             tests::{set_modified, test_store, utc, TestRoot},
             ActivitySignal, KeepReason,
         },
@@ -587,8 +588,7 @@ mod tests {
             let StoreEntry::Recognized { name, metadata } = entry else {
                 continue;
             };
-            let build_activity = BuildActivity::read(store, &name);
-            let entry = classify(store, name, metadata, build_activity);
+            let entry = examine(store, name, metadata, now(), &policy());
             match decide(&entry, now(), &policy()) {
                 Decision::RemoveOrphan { .. } => names.push(entry.name),
                 Decision::Keep(_) => {}
@@ -719,10 +719,16 @@ mod tests {
 
     #[test]
     fn test_recheck_leaves_an_entry_that_cargo_builds_in() {
-        for build_dir in ["target/debug", "target/x86_64-unknown-linux-gnu/release"] {
+        let build_dirs = [
+            "target/debug",
+            "target/x86_64-unknown-linux-gnu/release",
+            "target/tool/x86_64-unknown-linux-gnu/debug",
+        ];
+        for build_dir in build_dirs {
             let root = TestRoot::new();
             write_orphan(&root, "entry");
             let free_lock_path = root.write_file("store/entry/target/release/.cargo-lock", 0);
+            root.write_file("store/entry/target/tool/debug/.cargo-lock", 0);
             let lock_path = root.write_file(&format!("store/entry/{build_dir}/.cargo-lock"), 0);
             let store = test_store(&root);
             let name = EntryName::new("entry");

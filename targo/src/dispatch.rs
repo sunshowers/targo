@@ -1,6 +1,6 @@
 use crate::{
     cargo_cli::{CargoCli, CargoOutput},
-    gc::{self, GcPolicy},
+    gc::{self, GcMode, GcPolicy, GcStatus},
     helpers::resolve_location,
     store::{remove_target_dir, LockedStore, TargetDirSetup},
 };
@@ -17,7 +17,7 @@ use std::{
     fmt, io, iter,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
-    process::ExitStatus,
+    process::{ExitCode, ExitStatus},
     time::Duration,
 };
 use tracing_subscriber::EnvFilter;
@@ -43,10 +43,10 @@ pub enum TargoCommand {
         )]
         args: Vec<OsString>,
     },
-    /// Report the store entries that no workspace links to any more.
+    /// Remove the store entries that no workspace links to any more.
     Gc {
-        /// Report what would be removed, and change nothing (required: gc can't remove yet).
-        #[arg(long, required = true)]
+        /// Report what would be removed, and change nothing.
+        #[arg(long)]
         dry_run: bool,
 
         /// How long an entry is kept after it was last used or built in, once no workspace
@@ -62,21 +62,27 @@ pub enum TargoCommand {
 }
 
 impl TargoApp {
-    pub fn exec(self) -> Result<()> {
+    pub fn exec(self) -> Result<ExitCode> {
         let filter = EnvFilter::from_env("TARGO_LOG");
         tracing_subscriber::fmt().with_env_filter(filter).init();
         match self.command {
             TargoCommand::WrapCargo { args } => exec_wrap_cargo(args),
-            // clap requires `--dry-run`, so the flag itself says nothing.
             TargoCommand::Gc {
-                dry_run: _,
+                dry_run,
                 orphan_grace,
-            } => exec_gc(GcPolicy { orphan_grace }),
+            } => {
+                let mode = if dry_run {
+                    GcMode::DryRun
+                } else {
+                    GcMode::Remove
+                };
+                exec_gc(mode, GcPolicy { orphan_grace })
+            }
         }
     }
 }
 
-fn exec_wrap_cargo(args: Vec<OsString>) -> Result<()> {
+fn exec_wrap_cargo(args: Vec<OsString>) -> Result<ExitCode> {
     // Checked first so that a bad override fails even when targo is disabled.
     let store_dir_override = store_dir_override_from_env()?;
 
@@ -106,12 +112,29 @@ fn exec_wrap_cargo(args: Vec<OsString>) -> Result<()> {
 
     parsed_args.cargo_command().run_or_exec()?;
 
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
-fn exec_gc(policy: GcPolicy) -> Result<()> {
+/// The exit code of a gc that did nothing because another one was running.
+///
+/// This is `EX_TEMPFAIL`: not success, since nothing was collected, and not the failure of 1.
+const GC_BUSY_EXIT_CODE: u8 = 75;
+
+fn exec_gc(mode: GcMode, policy: GcPolicy) -> Result<ExitCode> {
     let store_dir = choose_store_dir(store_dir_override_from_env()?)?;
-    gc::dry_run(store_dir, &policy, Utc::now(), &mut io::stdout().lock())
+    let status = gc::run(
+        store_dir,
+        mode,
+        &policy,
+        &Utc::now,
+        &mut io::stdout().lock(),
+        &mut io::stderr().lock(),
+    )?;
+    Ok(match status {
+        GcStatus::Completed => ExitCode::SUCCESS,
+        GcStatus::Failed => ExitCode::FAILURE,
+        GcStatus::AnotherGcRunning => ExitCode::from(GC_BUSY_EXIT_CODE),
+    })
 }
 
 /// Opens the store and points `target_dir` into it. The store is returned still locked.
@@ -641,27 +664,35 @@ mod tests {
         };
 
         const WEEK: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+        // Each case is the arguments, whether they ask for a dry run, and the grace period.
         let data = [
-            ("--dry-run", WEEK),
-            ("--orphan-grace 90m --dry-run", Duration::from_secs(90 * 60)),
-            ("--dry-run --orphan-grace=0s", Duration::ZERO),
+            ("", false, WEEK),
+            ("--dry-run", true, WEEK),
+            ("--orphan-grace 90m", false, Duration::from_secs(90 * 60)),
+            ("--dry-run --orphan-grace=0s", true, Duration::ZERO),
         ];
-        for (input, expected) in data {
+        for (input, expected_dry_run, expected_grace) in data {
             let app = parse(input).unwrap_or_else(|error| panic!("for {input:?}: {error}"));
             match app.command {
-                TargoCommand::Gc { orphan_grace, .. } => {
-                    assert_eq!(orphan_grace, expected, "for {input:?}");
+                TargoCommand::Gc {
+                    dry_run,
+                    orphan_grace,
+                } => {
+                    assert_eq!(
+                        (dry_run, orphan_grace),
+                        (expected_dry_run, expected_grace),
+                        "for {input:?}"
+                    );
                 }
                 TargoCommand::WrapCargo { .. } => panic!("for {input:?}, clap parsed wrap-cargo"),
             }
         }
 
         let error_data = [
-            ("", ErrorKind::MissingRequiredArgument),
-            ("--orphan-grace 1d", ErrorKind::MissingRequiredArgument),
-            ("--dry-run --orphan-grace soon", ErrorKind::ValueValidation),
+            ("--orphan-grace soon", ErrorKind::ValueValidation),
             // A number needs a unit.
             ("--dry-run --orphan-grace 1", ErrorKind::ValueValidation),
+            ("--dry-run=yes", ErrorKind::TooManyValues),
         ];
         for (input, expected) in error_data {
             let error = parse(input).expect_err("clap rejects the arguments");

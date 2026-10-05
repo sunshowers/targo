@@ -25,6 +25,24 @@ pub(crate) struct ExclusiveLock {
 impl ExclusiveLock {
     /// Creates `lock_name` in `dir` if it doesn't exist, and blocks until it is locked.
     pub(crate) fn acquire(dir: &DirWithPath, lock_name: &str) -> Result<Self> {
+        let (file, lock_path) = Self::open(dir, lock_name)?;
+        FileExt::lock_exclusive(&file)
+            .wrap_err_with(|| format!("failed to obtain exclusive lock at `{lock_path}`"))?;
+        Ok(Self { file, lock_path })
+    }
+
+    /// Like [`Self::acquire`], but returns [`TryLock::Busy`] instead of blocking.
+    pub(crate) fn try_acquire(dir: &DirWithPath, lock_name: &str) -> Result<TryLock<Self>> {
+        let (file, lock_path) = Self::open(dir, lock_name)?;
+        let attempt = try_lock_exclusive(file)
+            .wrap_err_with(|| format!("failed to obtain exclusive lock at `{lock_path}`"))?;
+        Ok(match attempt {
+            TryLock::Acquired(file) => TryLock::Acquired(Self { file, lock_path }),
+            TryLock::Busy => TryLock::Busy,
+        })
+    }
+
+    fn open(dir: &DirWithPath, lock_name: &str) -> Result<(fs::File, Utf8PathBuf)> {
         let mut open_opts = cap_std::fs::OpenOptions::new();
         open_opts.write(true).create(true);
         let lock_path = dir.path().join(lock_name);
@@ -35,15 +53,36 @@ impl ExclusiveLock {
             .open_with(lock_name, &open_opts)
             .wrap_err_with(|| format!("failed to open lock at `{lock_path}`"))?
             .into_std();
-        file.lock_exclusive()
-            .wrap_err_with(|| format!("failed to obtain exclusive lock at `{lock_path}`"))?;
-        Ok(Self { file, lock_path })
+        Ok((file, lock_path))
     }
 
     /// Releases the lock. Dropping releases it too, but cannot report a failure.
     pub(crate) fn unlock(self) -> Result<()> {
         FileExt::unlock(&self.file)
             .wrap_err_with(|| format!("failed to release lock at `{}`", self.lock_path))
+    }
+}
+
+/// What came of trying to take a lock without blocking.
+#[derive(Debug)]
+#[must_use]
+pub(crate) enum TryLock<T> {
+    Acquired(T),
+    /// Something else holds the lock.
+    Busy,
+}
+
+/// Tries to lock `file` exclusively without blocking. The lock is held until the file is dropped.
+///
+/// This is `flock`, which is also how Cargo locks its build directories.
+pub(crate) fn try_lock_exclusive(file: fs::File) -> io::Result<TryLock<fs::File>> {
+    // Called through the trait: `File` has locking methods of its own, with other error types.
+    match FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(TryLock::Acquired(file)),
+        Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+            Ok(TryLock::Busy)
+        }
+        Err(error) => Err(error),
     }
 }
 

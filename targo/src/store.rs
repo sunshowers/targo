@@ -1,14 +1,14 @@
 use crate::{
-    helpers::{DirWithPath, ExclusiveLock},
+    helpers::{DirWithPath, ExclusiveLock, TryLock},
     metadata::{TargetDirMetadata, TargoStoreMetadata},
 };
 use camino::{Utf8Path, Utf8PathBuf};
-use cap_std::{ambient_authority, fs_utf8::Dir};
+use cap_std::{ambient_authority, fs::MetadataExt as _, fs_utf8::Dir};
 use color_eyre::{
     eyre::{bail, Context},
     Report, Result,
 };
-use std::{ffi::OsString, fmt, fs, io};
+use std::{ffi::OsString, fmt, fs, io, os::unix::fs::MetadataExt as _};
 use xxhash_rust::xxh3::xxh3_64;
 
 /// The targo store, with `targo.lock` held exclusively for as long as this value exists.
@@ -160,13 +160,15 @@ fn read_store_metadata(store_dir: &DirWithPath) -> Result<Option<TargoStoreMetad
 
 /// A targo store that already exists, opened without taking `targo.lock`.
 ///
-/// Nothing is written through it, and what it reads can change at any time.
+/// What it reads can change at any time. Only gc changes the store through it.
 #[derive(Debug)]
 pub(crate) struct UnlockedStore {
     store_dir: DirWithPath,
 }
 
 impl UnlockedStore {
+    const GC_LOCK_FILE_NAME: &'static str = "gc.lock";
+
     /// Opens the store at `store_dir_path`. Returns `None` if no directory is there.
     pub(crate) fn open(store_dir_path: Utf8PathBuf) -> Result<Option<Self>> {
         let store_dir = match Dir::open_ambient_dir(&store_dir_path, ambient_authority()) {
@@ -239,6 +241,43 @@ impl UnlockedStore {
             .collect())
     }
 
+    /// Tries to take `gc.lock`, which a gc run that removes entries holds until it ends.
+    pub(crate) fn try_lock_gc(&self) -> Result<TryLock<ExclusiveLock>> {
+        ExclusiveLock::try_acquire(&self.store_dir, Self::GC_LOCK_FILE_NAME)
+    }
+
+    /// Takes `targo.lock` in the directory that was opened, which keeps `wrap-cargo` out.
+    pub(crate) fn lock(&self) -> Result<StoreLock<'_>> {
+        let lock = ExclusiveLock::acquire(&self.store_dir, LockedStore::LOCK_FILE_NAME)?;
+        // `wrap-cargo` locks whatever is at the path, which has to be this directory.
+        self.ensure_at_path()?;
+        Ok(StoreLock { store: self, lock })
+    }
+
+    /// Fails unless the store's path still leads to the directory that was opened.
+    pub(crate) fn ensure_at_path(&self) -> Result<()> {
+        let path = self.store_dir.path();
+        let opened = self
+            .store_dir
+            .dir()
+            .dir_metadata()
+            .wrap_err_with(|| format!("failed to read metadata for the open store `{path}`"))?;
+        let at_path = fs::metadata(path).wrap_err_with(|| {
+            format!("failed to read metadata for targo store directory `{path}`")
+        })?;
+        if (opened.dev(), opened.ino()) != (at_path.dev(), at_path.ino()) {
+            bail!(
+                "targo store directory `{path}` was replaced by another directory while gc \
+                 was running: gc removes nothing more, run it again to collect the new store"
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn dir(&self) -> &DirWithPath {
+        &self.store_dir
+    }
+
     /// The directory of the entry `name`.
     pub(crate) fn entry_path(&self, name: &EntryName) -> Utf8PathBuf {
         self.store_dir.path().join(&name.0)
@@ -264,6 +303,11 @@ impl UnlockedStore {
                 })
             }
         };
+        self.reread_entry(name)
+    }
+
+    /// Reads the entry `name` as it is now.
+    pub(crate) fn reread_entry(&self, name: EntryName) -> StoreEntry {
         match self.read_entry_metadata(&name) {
             Ok(metadata) => StoreEntry::Recognized { name, metadata },
             Err(reason) => StoreEntry::Unrecognized(UnrecognizedDir {
@@ -289,6 +333,25 @@ impl UnlockedStore {
     }
 }
 
+/// `targo.lock`, held in the directory that an [`UnlockedStore`] has open.
+#[derive(Debug)]
+#[must_use]
+pub(crate) struct StoreLock<'a> {
+    store: &'a UnlockedStore,
+    lock: ExclusiveLock,
+}
+
+impl<'a> StoreLock<'a> {
+    pub(crate) fn store(&self) -> &'a UnlockedStore {
+        self.store
+    }
+
+    /// Releases the lock.
+    pub(crate) fn unlock(self) -> Result<()> {
+        self.lock.unlock()
+    }
+}
+
 /// The name of an entry's directory in the store, which is an encoded workspace path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EntryName(String);
@@ -297,6 +360,10 @@ impl EntryName {
     #[cfg(test)]
     pub(crate) fn new(name: &str) -> Self {
         Self(name.to_owned())
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -710,6 +777,80 @@ mod tests {
             error.to_string(),
             format!("failed to open targo store directory `{}`", dirs.store_dir)
         );
+    }
+
+    fn open_unlocked_store(dirs: &TestDirs) -> UnlockedStore {
+        dirs.open_store().unlock().expect("unlocked store");
+        UnlockedStore::open(dirs.store_dir.clone())
+            .expect("opened store")
+            .expect("the store exists")
+    }
+
+    #[test]
+    fn test_unlocked_store_lock_needs_the_store_at_its_path() {
+        let dirs = TestDirs::new();
+        let store = open_unlocked_store(&dirs);
+
+        let lock = store.lock().expect("locked store");
+        assert_contended(&dirs.lock_probe(), "while gc holds the store lock");
+        lock.unlock().expect("unlocked store");
+
+        // As when the path is pointed at another disk while gc runs.
+        let moved_dir = dirs.store_dir.with_file_name("moved-store");
+        fs::rename(&dirs.store_dir, &moved_dir).expect("moved store");
+        dirs.open_store().unlock().expect("made a new store");
+        let error = store.lock().expect_err("another store is at the path");
+        let expected = format!(
+            "targo store directory `{}` was replaced by another directory",
+            dirs.store_dir
+        );
+        assert!(
+            error.to_string().starts_with(&expected),
+            "error was: {error}"
+        );
+        let moved_probe =
+            fs::File::open(moved_dir.join(LockedStore::LOCK_FILE_NAME)).expect("opened lock file");
+        moved_probe
+            .try_lock_exclusive()
+            .expect("the lock is not kept after the failure");
+        drop(moved_probe);
+
+        fs::remove_dir_all(&dirs.store_dir).expect("removed the new store");
+        let error = store.lock().expect_err("nothing is at the path");
+        let expected = format!(
+            "failed to read metadata for targo store directory `{}`",
+            dirs.store_dir
+        );
+        assert_eq!(error.to_string(), expected);
+
+        fs::rename(&moved_dir, &dirs.store_dir).expect("moved store back");
+        let lock = store.lock().expect("the store is at its path again");
+        lock.unlock().expect("unlocked store");
+    }
+
+    #[test]
+    fn test_gc_lock_does_not_block() {
+        let dirs = TestDirs::new();
+        let store = open_unlocked_store(&dirs);
+        let other_store = open_unlocked_store(&dirs);
+
+        let gc_lock = match store.try_lock_gc().expect("tried the gc lock") {
+            TryLock::Acquired(gc_lock) => gc_lock,
+            TryLock::Busy => panic!("no gc is running"),
+        };
+        match other_store.try_lock_gc().expect("tried the gc lock") {
+            TryLock::Acquired(_) => panic!("the gc lock is held"),
+            TryLock::Busy => {}
+        }
+        dirs.lock_probe()
+            .try_lock_exclusive()
+            .expect("the store lock is another lock");
+
+        gc_lock.unlock().expect("unlocked");
+        match other_store.try_lock_gc().expect("tried the gc lock") {
+            TryLock::Acquired(_) => {}
+            TryLock::Busy => panic!("the gc lock was released"),
+        }
     }
 
     // A shared probe is contended only by an exclusive lock.

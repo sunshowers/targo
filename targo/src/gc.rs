@@ -1,11 +1,15 @@
+mod removal;
+
+use self::removal::Remover;
 use crate::{
+    helpers::TryLock,
     metadata::TargetDirMetadata,
     store::{EntryName, StoreEntry, UnlockedStore, UnrecognizedDir},
 };
 use camino::{Utf8Path, Utf8PathBuf};
 use cap_std::fs::{Dir, Metadata, MetadataExt as _};
 use chrono::{DateTime, Utc};
-use color_eyre::{eyre::WrapErr, Result};
+use color_eyre::{eyre::WrapErr, Report, Result};
 use std::{
     cmp::Reverse,
     collections::HashSet,
@@ -23,22 +27,101 @@ pub(crate) struct GcPolicy {
     pub(crate) orphan_grace: Duration,
 }
 
-/// Reports to `out` what gc would collect from the store at `store_dir`, and changes nothing.
-pub(crate) fn dry_run(
+/// Whether gc removes what it decides to collect.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum GcMode {
+    /// Report what would be removed, and change nothing.
+    DryRun,
+    Remove,
+}
+
+impl GcMode {
+    fn wording(self) -> Wording {
+        match self {
+            Self::DryRun => Wording {
+                remove: "would remove",
+                keep: "would keep",
+                skip: "would skip",
+                and_keep: "keep",
+            },
+            Self::Remove => Wording {
+                remove: "removed",
+                keep: "kept",
+                skip: "skipped",
+                and_keep: "kept",
+            },
+        }
+    }
+}
+
+/// The verbs of the report, which differ between a dry run and a real one.
+#[derive(Clone, Copy, Debug)]
+struct Wording {
+    remove: &'static str,
+    keep: &'static str,
+    skip: &'static str,
+    /// The second verb of the summary line.
+    and_keep: &'static str,
+}
+
+/// How a gc run ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub(crate) enum GcStatus {
+    Completed,
+    /// At least one removal failed. Each failure has been reported.
+    Failed,
+    /// Another gc run holds `gc.lock`, so this one did nothing.
+    AnotherGcRunning,
+}
+
+/// Gives the current time.
+pub(crate) type Clock<'a> = &'a dyn Fn() -> DateTime<Utc>;
+
+/// Collects the store at `store_dir`. The report goes to `out`, and failures go to `err`.
+///
+/// `clock` is read again before each removal, which can come long after the run started.
+pub(crate) fn run(
     store_dir: Utf8PathBuf,
+    mode: GcMode,
     policy: &GcPolicy,
-    now: DateTime<Utc>,
+    clock: Clock<'_>,
     out: &mut dyn Write,
-) -> Result<()> {
+    err: &mut dyn Write,
+) -> Result<GcStatus> {
+    let mut output = Output {
+        out,
+        err,
+        error: None,
+    };
     let Some(store) = UnlockedStore::open(store_dir.clone())? else {
-        return report_result(writeln!(
-            out,
+        output.line(format_args!(
             "nothing to collect: there is no targo store at `{store_dir}`"
         ));
+        output.finish()?;
+        return Ok(GcStatus::Completed);
     };
 
+    let mut collector = match mode {
+        GcMode::DryRun => Collector::DryRun,
+        GcMode::Remove => match Remover::start(&store, clock())? {
+            TryLock::Acquired(remover) => Collector::Remove(remover),
+            TryLock::Busy => {
+                output.failure(format_args!(
+                    "another targo gc is running on the store at `{store_dir}`: \
+                     nothing was removed"
+                ));
+                output.finish()?;
+                return Ok(GcStatus::AnotherGcRunning);
+            }
+        },
+    };
+    let wording = mode.wording();
+    let mut tally = Tally::default();
+    collector.remove_leftovers(&mut tally, &mut output)?;
+
+    let now = clock();
     let mut removals = Vec::new();
-    let mut kept_counts = KeptCounts::default();
     let mut kept_lines = Vec::new();
     for entry in store.entries()? {
         match entry {
@@ -52,58 +135,110 @@ pub(crate) fn dry_run(
                         signal,
                     }),
                     Decision::Keep(reason) => {
-                        kept_counts.add(reason);
-                        kept_lines.extend(kept_line(&entry, reason));
+                        tally.kept.add(reason);
+                        kept_lines.extend(kept_line(wording, &entry, reason));
                     }
                 }
             }
             StoreEntry::Unrecognized(dir) => {
-                kept_counts.unrecognized += 1;
-                kept_lines.push(unrecognized_line(&dir));
+                tally.kept.unrecognized += 1;
+                kept_lines.push(unrecognized_line(wording, &dir));
             }
         }
     }
     // Oldest first. The sort is stable, so entries that are as old stay in name order.
     removals.sort_by_key(|removal| Reverse(removal.idle));
 
-    report_result(write_report(
-        &store,
-        &removals,
-        &kept_lines,
-        &kept_counts,
-        out,
-    ))
-}
-
-fn write_report(
-    store: &UnlockedStore,
-    removals: &[Removal],
-    kept_lines: &[String],
-    kept_counts: &KeptCounts,
-    out: &mut dyn Write,
-) -> io::Result<()> {
-    let mut total_size = ReportedSize::default();
     for removal in removals {
-        // Slow, so each line is written as soon as its entry is measured.
-        let usage = measure_entry(store, &removal.entry.name);
-        writeln!(out, "{}", removal_line(removal, &usage))?;
-        total_size.add(&usage);
+        // Only between entries, so that a run never stops between a rename and its delete.
+        if output.is_closed() {
+            break;
+        }
+        // Slow, so each line is written as soon as its entry is dealt with.
+        match collector.collect(&store, removal, policy, clock)? {
+            Outcome::Removed { removal, usage } => {
+                output.line(removal_line(wording, &removal, &usage));
+                tally.removed += 1;
+                tally.freed.add(&usage);
+            }
+            Outcome::InUse { name, reason } => {
+                output.line(format_args!("{} `{name}`: in use, {reason}", wording.skip));
+                tally.kept.in_use += 1;
+            }
+            Outcome::Kept { entry, reason } => {
+                tally.kept.add(reason);
+                kept_lines.extend(kept_line(wording, &entry, reason));
+            }
+            Outcome::Unrecognized(dir) => {
+                tally.kept.unrecognized += 1;
+                kept_lines.push(unrecognized_line(wording, &dir));
+            }
+            Outcome::Failed { name, error } => {
+                // The alternate form puts the whole chain of causes on one line.
+                output.failure(format_args!("failed to remove `{name}`: {error:#}"));
+                tally.failed += 1;
+            }
+        }
     }
-    for line in kept_lines {
-        writeln!(out, "{line}")?;
+    for line in &kept_lines {
+        output.line(line);
     }
-    writeln!(
-        out,
-        "would remove {} ({total_size}) and keep {kept_counts}",
-        Entries(removals.len()),
-    )
+    output.line(summary_line(wording, &tally));
+    output.finish()?;
+    Ok(tally.status())
 }
 
-/// A reader that stops early, as with `targo gc --dry-run | head`, is not a failure.
-fn report_result(result: io::Result<()>) -> Result<()> {
-    match result {
-        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
-        result => result.wrap_err("failed to write the gc report"),
+/// The report on `out` and the failures on `err`. Once a write fails, nothing more is written.
+struct Output<'a> {
+    out: &'a mut dyn Write,
+    err: &'a mut dyn Write,
+    error: Option<io::Error>,
+}
+
+impl Output<'_> {
+    fn line(&mut self, line: impl fmt::Display) {
+        if self.error.is_none() {
+            self.error = writeln!(self.out, "{line}").err();
+        }
+    }
+
+    fn failure(&mut self, line: impl fmt::Display) {
+        if self.error.is_none() {
+            self.error = writeln!(self.err, "{line}").err();
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.error.is_some()
+    }
+
+    /// A reader that stops early, as with `targo gc | head`, is not a failure.
+    fn finish(self) -> Result<()> {
+        match self.error {
+            None => Ok(()),
+            Some(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+            Some(error) => Err(error).wrap_err("failed to write the gc report"),
+        }
+    }
+}
+
+/// What a run did, for the summary line and the exit status.
+#[derive(Debug, Default)]
+struct Tally {
+    removed: usize,
+    freed: ReportedSize,
+    failed: usize,
+    failed_leftovers: usize,
+    kept: KeptCounts,
+}
+
+impl Tally {
+    fn status(&self) -> GcStatus {
+        if self.failed + self.failed_leftovers > 0 {
+            GcStatus::Failed
+        } else {
+            GcStatus::Completed
+        }
     }
 }
 
@@ -113,6 +248,118 @@ struct Removal {
     entry: RecognizedEntry,
     idle: Duration,
     signal: ActivitySignal,
+}
+
+/// What came of an entry that was to be removed.
+#[derive(Debug)]
+enum Outcome {
+    /// It was removed or, in a dry run, would be.
+    Removed {
+        removal: Removal,
+        usage: DiskUsage,
+    },
+    InUse {
+        name: EntryName,
+        reason: InUse,
+    },
+    /// A second look, under the store lock, found a reason to keep it.
+    Kept {
+        entry: RecognizedEntry,
+        reason: KeepReason,
+    },
+    /// By the second look, its metadata was gone or unreadable.
+    Unrecognized(UnrecognizedDir),
+    Failed {
+        name: EntryName,
+        error: Report,
+    },
+}
+
+/// Why an entry counts as in use.
+#[derive(Debug)]
+enum InUse {
+    /// Cargo is building in the entry.
+    CargoLockHeld(PathBuf),
+    /// This path vanished while the entry was measured, so something is changing the entry.
+    ChangedWhileMeasured(PathBuf),
+}
+
+impl fmt::Display for InUse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CargoLockHeld(path) => {
+                write!(f, "Cargo holds the lock at `{}`", path.display())
+            }
+            Self::ChangedWhileMeasured(path) => write!(
+                f,
+                "`{}` vanished while the entry was being measured",
+                path.display()
+            ),
+        }
+    }
+}
+
+/// What a run does with the entries that it decides to remove.
+enum Collector<'a> {
+    DryRun,
+    Remove(Remover<'a>),
+}
+
+impl Collector<'_> {
+    /// Deletes what an interrupted run left in the trash.
+    fn remove_leftovers(&self, tally: &mut Tally, output: &mut Output<'_>) -> Result<()> {
+        let remover = match self {
+            Self::DryRun => return Ok(()),
+            Self::Remove(remover) => remover,
+        };
+        for name in remover.leftovers()? {
+            if output.is_closed() {
+                break;
+            }
+            let shown = Path::new(&name).display();
+            match remover.remove_leftover(&name) {
+                Ok(Measured::Usage(usage)) => output.line(format_args!(
+                    "removed leftover `{shown}` ({}) from an earlier run",
+                    ReportedSize::of(&usage)
+                )),
+                Ok(Measured::Changed(_)) => output.line(format_args!(
+                    "removed leftover `{shown}` from an earlier run"
+                )),
+                Err(error) => {
+                    output.failure(format_args!(
+                        "failed to remove leftover `{shown}`: {error:#}"
+                    ));
+                    tally.failed_leftovers += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Measures the entry of `removal` and then, unless this is a dry run, removes it.
+    fn collect(
+        &mut self,
+        store: &UnlockedStore,
+        removal: Removal,
+        policy: &GcPolicy,
+        clock: Clock<'_>,
+    ) -> Result<Outcome> {
+        let name = removal.entry.name.clone();
+        // Slow, so it is done before `targo.lock` is taken.
+        let usage = match measure_entry(store, &name) {
+            Measured::Usage(usage) => usage,
+            Measured::Changed(path) => {
+                return Ok(Outcome::InUse {
+                    name,
+                    reason: InUse::ChangedWhileMeasured(path),
+                });
+            }
+        };
+        match self {
+            Self::DryRun => Ok(Outcome::Removed { removal, usage }),
+            Self::Remove(remover) => remover.remove(&name, usage, policy, clock),
+        }
+    }
 }
 
 /// What is at the path of a backlink now.
@@ -606,8 +853,16 @@ struct DiskUsage {
     unmeasured: Option<PathErrors>,
 }
 
+/// What came of measuring a tree.
+#[derive(Debug)]
+enum Measured {
+    Usage(DiskUsage),
+    /// This path vanished during the walk, so something is changing the tree.
+    Changed(PathBuf),
+}
+
 /// Measures the disk usage of the entry `name`, which can take minutes.
-fn measure_entry(store: &UnlockedStore, name: &EntryName) -> DiskUsage {
+fn measure_entry(store: &UnlockedStore, name: &EntryName) -> Measured {
     let mut walk = UsageWalk::default();
     match store.open_entry_dir(name) {
         Ok(entry_dir) => walk.measure_tree(entry_dir.dir().as_cap_std(), entry_dir.path().as_ref()),
@@ -623,6 +878,8 @@ struct UsageWalk {
     /// Device and inode of each file counted so far that has more than one link.
     counted_hard_links: HashSet<(u64, u64)>,
     unmeasured: Option<PathErrors>,
+    /// The first path that was gone by the time the walk got to it.
+    vanished: Option<PathBuf>,
 }
 
 impl UsageWalk {
@@ -694,13 +951,22 @@ impl UsageWalk {
 
     fn record_unmeasured(&mut self, path: PathBuf, error: io::Error) {
         tracing::debug!("could not measure `{}`: {error}", path.display());
-        PathErrors::record(&mut self.unmeasured, path, error);
+        match error.kind() {
+            // The path was listed a moment ago, so it has just been removed.
+            io::ErrorKind::NotFound => {
+                self.vanished.get_or_insert(path);
+            }
+            _ => PathErrors::record(&mut self.unmeasured, path, error),
+        }
     }
 
-    fn finish(self) -> DiskUsage {
-        DiskUsage {
-            bytes: self.bytes,
-            unmeasured: self.unmeasured,
+    fn finish(self) -> Measured {
+        match self.vanished {
+            Some(path) => Measured::Changed(path),
+            None => Measured::Usage(DiskUsage {
+                bytes: self.bytes,
+                unmeasured: self.unmeasured,
+            }),
         }
     }
 }
@@ -721,6 +987,12 @@ struct ReportedSize {
 }
 
 impl ReportedSize {
+    fn of(usage: &DiskUsage) -> Self {
+        let mut size = Self::default();
+        size.add(usage);
+        size
+    }
+
     fn add(&mut self, usage: &DiskUsage) {
         self.bytes = self.bytes.saturating_add(usage.bytes);
         if usage.unmeasured.is_some() {
@@ -738,12 +1010,12 @@ impl fmt::Display for ReportedSize {
     }
 }
 
-fn removal_line(removal: &Removal, usage: &DiskUsage) -> String {
-    let mut size = ReportedSize::default();
-    size.add(usage);
+fn removal_line(wording: Wording, removal: &Removal, usage: &DiskUsage) -> String {
     let mut line = format!(
-        "would remove `{}` ({size}): orphaned, {} {} ago; {}",
+        "{} `{}` ({}): orphaned, {} {} ago; {}",
+        wording.remove,
         removal.entry.name,
+        ReportedSize::of(usage),
         removal.signal,
         Age(removal.idle),
         BacklinkList(&removal.entry.backlinks),
@@ -755,7 +1027,7 @@ fn removal_line(removal: &Removal, usage: &DiskUsage) -> String {
 }
 
 /// The line for an entry that is kept, if the reason is worth a line of its own.
-fn kept_line(entry: &RecognizedEntry, reason: KeepReason) -> Option<String> {
+fn kept_line(wording: Wording, entry: &RecognizedEntry, reason: KeepReason) -> Option<String> {
     let reason = match reason {
         KeepReason::Live | KeepReason::OrphanWithinGrace => return None,
         KeepReason::OrphanBuiltWithinGrace { idle } => {
@@ -770,18 +1042,34 @@ fn kept_line(entry: &RecognizedEntry, reason: KeepReason) -> Option<String> {
         }
     };
     Some(format!(
-        "would keep `{}`: {reason}; {}",
+        "{} `{}`: {reason}; {}",
+        wording.keep,
         entry.name,
         BacklinkList(&entry.backlinks),
     ))
 }
 
-fn unrecognized_line(dir: &UnrecognizedDir) -> String {
+fn unrecognized_line(wording: Wording, dir: &UnrecognizedDir) -> String {
     format!(
-        "would keep `{}`: unrecognized; {}",
+        "{} `{}`: unrecognized; {}",
+        wording.keep,
         Path::new(&dir.name).display(),
         dir.reason,
     )
+}
+
+fn summary_line(wording: Wording, tally: &Tally) -> String {
+    let mut line = format!(
+        "{} {} ({})",
+        wording.remove,
+        Entries(tally.removed),
+        tally.freed
+    );
+    if tally.failed > 0 {
+        line.push_str(&format!(", failed to remove {},", Entries(tally.failed)));
+    }
+    line.push_str(&format!(" and {} {}", wording.and_keep, tally.kept));
+    line
 }
 
 /// How many entries are kept, by reason.
@@ -793,6 +1081,7 @@ struct KeptCounts {
     unknown_build_activity: usize,
     unrecognized: usize,
     activity_in_future: usize,
+    in_use: usize,
 }
 
 impl KeptCounts {
@@ -819,6 +1108,7 @@ impl fmt::Display for KeptCounts {
             (self.unknown_build_activity, "with unknown build activity"),
             (self.unrecognized, "unrecognized"),
             (self.activity_in_future, "last active in the future"),
+            (self.in_use, "in use"),
         ];
         let total = counts.iter().map(|(count, _)| count).sum();
         write!(f, "{}", Entries(total))?;
@@ -928,14 +1218,14 @@ mod tests {
     };
 
     /// A directory nested inside a temp dir, so that a path with `..` in it stays inside.
-    struct TestRoot {
+    pub(super) struct TestRoot {
         // Held so that the directory is removed on drop.
         _temp_dir: camino_tempfile::Utf8TempDir,
         root: Utf8PathBuf,
     }
 
     impl TestRoot {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let temp_dir = camino_tempfile::tempdir().expect("created temp dir");
             let root = temp_dir.path().join("a/b/c");
             fs::create_dir_all(&root).expect("created root");
@@ -945,17 +1235,17 @@ mod tests {
             }
         }
 
-        fn path(&self, relative: &str) -> Utf8PathBuf {
+        pub(super) fn path(&self, relative: &str) -> Utf8PathBuf {
             self.root.join(relative)
         }
 
-        fn create_dir(&self, relative: &str) -> Utf8PathBuf {
+        pub(super) fn create_dir(&self, relative: &str) -> Utf8PathBuf {
             let path = self.path(relative);
             fs::create_dir_all(&path).expect("created dir");
             path
         }
 
-        fn write_file(&self, relative: &str, len: usize) -> Utf8PathBuf {
+        pub(super) fn write_file(&self, relative: &str, len: usize) -> Utf8PathBuf {
             let path = self.path(relative);
             fs::create_dir_all(path.parent().expect("path has a parent")).expect("created dir");
             let mut file = fs::File::create(&path).expect("created file");
@@ -966,7 +1256,7 @@ mod tests {
         }
 
         /// Creates a symlink at `relative` with `dest` as its contents.
-        fn symlink(&self, dest: impl AsRef<Utf8Path>, relative: &str) -> Utf8PathBuf {
+        pub(super) fn symlink(&self, dest: impl AsRef<Utf8Path>, relative: &str) -> Utf8PathBuf {
             let path = self.path(relative);
             fs::create_dir_all(path.parent().expect("path has a parent")).expect("created dir");
             symlink(dest.as_ref(), &path).expect("created symlink");
@@ -975,11 +1265,11 @@ mod tests {
     }
 
     /// A directory that nothing can be reached through, until this is dropped.
-    struct LockedDir(Utf8PathBuf);
+    pub(super) struct LockedDir(Utf8PathBuf);
 
     impl LockedDir {
         /// Returns `None` if permissions are not enforced, as when running as root.
-        fn new(path: Utf8PathBuf) -> Option<Self> {
+        pub(super) fn new(path: Utf8PathBuf) -> Option<Self> {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o000))
                 .expect("removed permissions");
             let locked = Self(path);
@@ -1002,7 +1292,7 @@ mod tests {
     }
 
     /// Opens the store at `store` in `root`, after giving it the metadata that makes it one.
-    fn test_store(root: &TestRoot) -> UnlockedStore {
+    pub(super) fn test_store(root: &TestRoot) -> UnlockedStore {
         let store_dir = root.create_dir("store");
         let metadata = serde_json::to_string(&TargoStoreMetadata::new()).expect("serialized");
         fs::write(
@@ -1067,13 +1357,13 @@ mod tests {
     }
 
     /// Sets when the directory at `path` was last modified.
-    fn set_modified(path: &Utf8Path, modified: DateTime<Utc>) {
+    pub(super) fn set_modified(path: &Utf8Path, modified: DateTime<Utc>) {
         let dir = fs::File::open(path).expect("opened directory");
         dir.set_modified(SystemTime::from(modified))
             .expect("set modification time");
     }
 
-    fn utc(rfc3339: &str) -> DateTime<Utc> {
+    pub(super) fn utc(rfc3339: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(rfc3339)
             .expect("parsed timestamp")
             .with_timezone(&Utc)
@@ -1472,7 +1762,10 @@ mod tests {
         let dir = Dir::open_ambient_dir(tree, ambient_authority()).expect("opened tree");
         let mut walk = UsageWalk::default();
         walk.measure_tree(&dir, tree.as_std_path());
-        walk.finish()
+        match walk.finish() {
+            Measured::Usage(usage) => usage,
+            Measured::Changed(path) => panic!("`{}` vanished", path.display()),
+        }
     }
 
     /// The disk usage of each of `paths` itself, without following symlinks.
@@ -1550,6 +1843,24 @@ mod tests {
             (unmeasured.first.error.kind(), unmeasured.other_paths),
             (io::ErrorKind::PermissionDenied, 1)
         );
+    }
+
+    #[test]
+    fn test_usage_walk_reports_a_path_that_vanished() {
+        let root = TestRoot::new();
+        let entry = root.create_dir("entry");
+        let dir = Dir::open_ambient_dir(&entry, ambient_authority()).expect("opened tree");
+        let not_found = || io::Error::from(io::ErrorKind::NotFound);
+
+        let mut walk = UsageWalk::default();
+        walk.measure_tree(&dir, entry.as_std_path());
+        walk.record_unmeasured("/store/entry/locked".into(), io::Error::other("no access"));
+        walk.record_unmeasured("/store/entry/gone".into(), not_found());
+        walk.record_unmeasured("/store/entry/gone-later".into(), not_found());
+        match walk.finish() {
+            Measured::Changed(path) => assert_eq!(path, Path::new("/store/entry/gone")),
+            Measured::Usage(usage) => panic!("the walk reported a size: {usage:?}"),
+        }
     }
 
     #[test]
@@ -1639,7 +1950,8 @@ mod tests {
     }
 
     #[test]
-    fn test_kept_lines_and_counts() {
+    fn test_kept_and_summary_lines() {
+        let wording = GcMode::Remove.wording();
         let last_used = utc("2026-03-08T19:00:00Z");
         let unknown_activity = BuildActivity::Unknown(PathError {
             path: "/store/entry/target".into(),
@@ -1653,12 +1965,12 @@ mod tests {
             (KeepReason::OrphanWithinGrace, None),
             (
                 KeepReason::OrphanBuiltWithinGrace { idle: 3 * hour },
-                Some("would keep `entry`: orphaned, last built 3h ago; no backlinks"),
+                Some("kept `entry`: orphaned, last built 3h ago; no backlinks"),
             ),
             (
                 KeepReason::UnknownBuildActivity,
                 Some(
-                    "would keep `entry`: build activity unknown, could not examine \
+                    "kept `entry`: build activity unknown, could not examine \
                      `/store/entry/target`: no access; no backlinks",
                 ),
             ),
@@ -1667,23 +1979,41 @@ mod tests {
                     ahead: 2 * hour,
                     signal: ActivitySignal::LastBuilt,
                 },
-                Some("would keep `entry`: last built 2h in the future; no backlinks"),
+                Some("kept `entry`: last built 2h in the future; no backlinks"),
             ),
         ];
-        let mut kept_counts = KeptCounts::default();
+        let mut tally = Tally::default();
         for (reason, expected) in data {
             assert_eq!(
-                kept_line(&entry, reason).as_deref(),
+                kept_line(wording, &entry, reason).as_deref(),
                 expected,
                 "for {reason:?}"
             );
-            kept_counts.add(reason);
+            tally.kept.add(reason);
         }
+        tally.kept.in_use += 1;
+        tally.removed += 1;
+
+        let kept = "kept 6 entries: 1 live, 2 orphaned within grace, \
+                    1 with unknown build activity, 1 last active in the future, 1 in use";
         assert_eq!(
-            kept_counts.to_string(),
-            "5 entries: 1 live, 2 orphaned within grace, \
-             1 with unknown build activity, 1 last active in the future"
+            summary_line(wording, &tally),
+            format!("removed 1 entry (0 B) and {kept}")
         );
+        assert_eq!(tally.status(), GcStatus::Completed);
+
+        tally.failed += 2;
+        assert_eq!(
+            summary_line(wording, &tally),
+            format!("removed 1 entry (0 B), failed to remove 2 entries, and {kept}")
+        );
+        assert_eq!(tally.status(), GcStatus::Failed);
+
+        let leftover_failed = Tally {
+            failed_leftovers: 1,
+            ..Tally::default()
+        };
+        assert_eq!(leftover_failed.status(), GcStatus::Failed);
     }
 
     #[test]
@@ -1714,7 +2044,7 @@ mod tests {
                 }),
             };
             assert_eq!(
-                removal_line(&removal, &lower_bound),
+                removal_line(GcMode::DryRun.wording(), &removal, &lower_bound),
                 format!(
                     "would remove `entry` (at least 1.5 KiB): orphaned, last used 3d ago; \
                      backlinks: `/workspace-0/target` (missing), `/workspace-1/target` \

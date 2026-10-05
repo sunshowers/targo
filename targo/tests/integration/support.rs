@@ -130,7 +130,7 @@ impl TestEnv {
         self.confined_command(env!("CARGO"))
     }
 
-    fn confined_command(&self, program: &str) -> Command {
+    pub(crate) fn confined_command(&self, program: &str) -> Command {
         let mut command = Command::new(program);
         for (name, _) in env::vars_os() {
             let name_str = name.to_string_lossy();

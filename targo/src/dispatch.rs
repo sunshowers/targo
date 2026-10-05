@@ -1,5 +1,5 @@
 use crate::{
-    cargo_cli::CargoCli,
+    cargo_cli::{CargoCli, CargoOutput},
     helpers::resolve_location,
     store::{remove_target_dir, LockedStore, TargetDirSetup},
 };
@@ -15,6 +15,7 @@ use std::{
     fmt, iter,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
+    process::ExitStatus,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -73,7 +74,13 @@ fn exec_wrap_cargo(args: Vec<OsString>) -> Result<()> {
 
             parsed_args
         }
-        WrapCargoArgs::Disabled { parsed_args } => parsed_args,
+        WrapCargoArgs::Disabled {
+            parsed_args,
+            reason,
+        } => {
+            reason.report();
+            parsed_args
+        }
     };
 
     parsed_args.cargo_command().run_or_exec()?;
@@ -173,7 +180,55 @@ enum WrapCargoArgs {
     },
     Disabled {
         parsed_args: ParsedCargoArgs,
+        reason: DisabledReason,
     },
+}
+
+/// Why targo leaves a Cargo command unmanaged.
+#[derive(Clone, Debug)]
+enum DisabledReason {
+    /// Cargo found no manifest, as for cargo version outside any workspace.
+    NoManifest,
+    /// Locating failed for another reason, such as a broken manifest.
+    LocateProjectFailed {
+        locate_project: CargoCli,
+        status: ExitStatus,
+        stderr: String,
+    },
+}
+
+impl DisabledReason {
+    fn report(&self) {
+        match self {
+            // Quiet, since Cargo complains itself if the command needs a manifest.
+            Self::NoManifest => {
+                tracing::debug!("disabled for this command: Cargo found no manifest");
+            }
+            Self::LocateProjectFailed {
+                locate_project,
+                status,
+                stderr,
+            } => {
+                let mut message = format!(
+                    "[targo] disabled for this command: `{locate_project}` failed with {status}"
+                );
+                // Indented to tell it apart from what the command prints next.
+                for line in stderr.lines() {
+                    message.push_str("\n    ");
+                    message.push_str(line);
+                }
+                eprintln!("{message}");
+            }
+        }
+    }
+}
+
+/// The message is the only signal, since Cargo's exit code is the same as for other errors.
+fn is_manifest_not_found(stderr: &str) -> bool {
+    // Warnings can come first, and the directory that follows can be anything.
+    stderr
+        .lines()
+        .any(|line| line.starts_with("error: could not find `Cargo.toml` in `"))
 }
 
 impl WrapCargoArgs {
@@ -187,11 +242,24 @@ impl WrapCargoArgs {
         // Determine the workspace dir.
         let locate_project = parsed_args.locate_project_command();
 
-        let output = match locate_project.stdout_output() {
-            Ok(output) => output,
-            Err(_) => {
-                eprintln!("[targo] error running cargo locate-project, disabling");
-                return Ok(Self::Disabled { parsed_args });
+        // An error, since a Cargo that can't be started is unlikely to run the command.
+        let output = match locate_project.output()? {
+            CargoOutput::Success { stdout } => stdout,
+            CargoOutput::Failed { status, stderr } => {
+                tracing::debug!("`{locate_project}` failed with {status}:\n{stderr}");
+                let reason = if is_manifest_not_found(&stderr) {
+                    DisabledReason::NoManifest
+                } else {
+                    DisabledReason::LocateProjectFailed {
+                        locate_project,
+                        status,
+                        stderr,
+                    }
+                };
+                return Ok(Self::Disabled {
+                    parsed_args,
+                    reason,
+                });
             }
         };
 
@@ -245,7 +313,10 @@ impl ParsedCargoArgs {
 
     fn locate_project_command(&self) -> CargoCli {
         let mut cli = CargoCli::new();
-        cli.args(["locate-project", "--workspace", "--message-format=plain"]);
+        // Options and values are separate words so that the command is shown unquoted.
+        cli.args(["locate-project", "--workspace", "--message-format", "plain"]);
+        // CARGO_TERM_COLOR could otherwise color the error that targo matches.
+        cli.args(["--color", "never"]);
         if let Some(manifest_path) = &self.manifest_path {
             // Cargo only accepts a path starting with `-` in the `=` form.
             let mut arg = OsString::from("--manifest-path=");
@@ -440,10 +511,14 @@ mod tests {
     #[test]
     fn test_locate_project_command() {
         let data = [
-            ("build", "locate-project --workspace --message-format=plain"),
+            (
+                "build",
+                "locate-project --workspace --message-format plain --color never",
+            ),
             (
                 "build --manifest-path=-x/Cargo.toml",
-                "locate-project --workspace --message-format=plain --manifest-path=-x/Cargo.toml",
+                "locate-project --workspace --message-format plain --color never \
+                 --manifest-path=-x/Cargo.toml",
             ),
         ];
         for (input, expected) in data {
@@ -453,6 +528,39 @@ mod tests {
                 shell_args(expected),
                 "for {input:?}"
             );
+        }
+    }
+
+    #[test]
+    fn test_is_manifest_not_found() {
+        // These are Cargo 1.99's outputs, with shortened paths.
+        let not_found = [
+            "error: could not find `Cargo.toml` in `/dir` or any parent directory\n",
+            "error: could not find `Cargo.toml` in `/dir` or any parent directory, \
+             but found cargo.toml please try to rename it to Cargo.toml\n",
+            "warning: `/dir/.cargo/config` is deprecated in favor of `config.toml`\n  \
+             |\n  = help: if you need to support cargo 1.38 or earlier, you can symlink \
+             `config` to `config.toml`\n\
+             error: could not find `Cargo.toml` in `/dir` or any parent directory\n",
+        ];
+        for stderr in not_found {
+            assert!(is_manifest_not_found(stderr), "for {stderr:?}");
+        }
+
+        let other = [
+            "",
+            "error: key with no value, expected `=`\n --> Cargo.toml:1:6\n",
+            "error: manifest path `nope/Cargo.toml` does not exist\n",
+            "error: toolchain 'nonexistent' is not installed\n",
+            // Synthetic case, the message as the cause of another error.
+            "error: failed to load manifest\n\nCaused by:\n  \
+             could not find `Cargo.toml` in `/dir` or any parent directory\n",
+            // Output under CARGO_TERM_COLOR=always without `--color never`.
+            "\x1b[1m\x1b[91merror\x1b[0m: could not find `Cargo.toml` in `/dir` \
+             or any parent directory\n",
+        ];
+        for stderr in other {
+            assert!(!is_manifest_not_found(stderr), "for {stderr:?}");
         }
     }
 

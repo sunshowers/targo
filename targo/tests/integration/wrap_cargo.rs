@@ -4,8 +4,9 @@ use std::{
     ffi::{OsStr, OsString},
     fs,
     io::{BufRead, BufReader},
+    iter,
     os::unix::{ffi::OsStrExt, fs::symlink},
-    process::{Command, Stdio},
+    process::{Command, Output, Stdio},
 };
 
 #[test]
@@ -349,18 +350,136 @@ fn wrap_cargo_releases_store_lock_before_cargo_runs() {
     assert!(status.success(), "stand-in cargo exited with {status}");
 }
 
+#[test]
+fn wrap_cargo_is_quiet_outside_a_workspace() {
+    let env = TestEnv::new();
+    let before = env.snapshot();
+
+    // Forced color must not hide Cargo's "no manifest" error from targo.
+    for color in ["auto", "always"] {
+        let output = run_wrap_cargo(env.targo().env("CARGO_TERM_COLOR", color), env.root());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            (stdout.lines().count(), &*stderr),
+            (1, ""),
+            "with color {color:?}, only Cargo's version is printed, stdout was:\n{stdout}"
+        );
+    }
+
+    let output = run_wrap_cargo(env.targo().env("TARGO_LOG", "debug"), env.root());
+    let logged = [output.stdout, output.stderr].concat();
+    let logged = String::from_utf8_lossy(&logged);
+    assert!(
+        logged.contains("disabled for this command: Cargo found no manifest"),
+        "the reason is in the debug log, which was:\n{logged}"
+    );
+
+    assert_eq!(env.snapshot(), before, "a disabled run changes nothing");
+}
+
+#[test]
+fn wrap_cargo_shows_why_cargo_cannot_locate_the_workspace() {
+    let env = TestEnv::new();
+    let workspace_dir = env.create_workspace("workspace");
+    fs::write(workspace_dir.join("Cargo.toml"), "not a manifest [").expect("wrote manifest");
+
+    // Cargo's wording varies by version, so ask the real Cargo for it.
+    let locate_project_args = [
+        "locate-project",
+        "--workspace",
+        "--message-format",
+        "plain",
+        "--color",
+        "never",
+    ];
+    let cargo_output = env
+        .cargo()
+        .current_dir(&workspace_dir)
+        .args(locate_project_args)
+        .output()
+        .expect("ran cargo");
+    let cargo_stderr = String::from_utf8(cargo_output.stderr).expect("Cargo's stderr is UTF-8");
+    assert!(
+        !cargo_output.status.success() && !cargo_stderr.is_empty(),
+        "Cargo rejects the manifest, with stderr:\n{cargo_stderr}"
+    );
+
+    let locate_project = shell_words::join(iter::once(env!("CARGO")).chain(locate_project_args));
+    let mut expected = format!(
+        "[targo] disabled for this command: `{locate_project}` failed with {}\n",
+        cargo_output.status
+    );
+    for line in cargo_stderr.lines() {
+        expected.push_str("    ");
+        expected.push_str(line);
+        expected.push('\n');
+    }
+
+    let before = env.snapshot();
+    let output = run_wrap_cargo(&mut env.targo(), &workspace_dir);
+    assert_eq!(String::from_utf8_lossy(&output.stderr), expected);
+    assert_eq!(env.snapshot(), before, "a disabled run changes nothing");
+}
+
+#[test]
+fn wrap_cargo_fails_when_cargo_cannot_be_run() {
+    let env = TestEnv::new();
+    let workspace_dir = env.create_workspace("workspace");
+    let not_executable = env.root().join("not-executable");
+    fs::write(&not_executable, "").expect("wrote file");
+
+    let data = [
+        (
+            env.root().join("missing/cargo"),
+            "No such file or directory (os error 2)",
+        ),
+        (not_executable, "Permission denied (os error 13)"),
+    ];
+    let before = env.snapshot();
+    for (cargo, os_error) in data {
+        let output = env
+            .targo()
+            .env("CARGO", &cargo)
+            .current_dir(&workspace_dir)
+            .args(["wrap-cargo", "version"])
+            .output()
+            .expect("ran targo");
+
+        let expected = format!(
+            "failed to run `{} locate-project ",
+            shell_words::quote(cargo.as_str())
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success() && stderr.contains(&expected) && stderr.contains(os_error),
+            "for `{cargo}`, expected failure with {expected:?} and {os_error:?}, stderr was:\n{stderr}"
+        );
+        assert_eq!(
+            stderr.matches("os error").count(),
+            1,
+            "for `{cargo}`, there is one error, not a second from running the command:\n{stderr}"
+        );
+    }
+
+    assert_eq!(env.snapshot(), before, "a failed run changes nothing");
+}
+
 /// Runs `targo wrap-cargo version` in `workspace_dir`, which must succeed.
-fn run_wrap_cargo(command: &mut Command, workspace_dir: &Utf8Path) {
+fn run_wrap_cargo(command: &mut Command, workspace_dir: &Utf8Path) -> Output {
     let output = command
         .current_dir(workspace_dir)
         .args(["wrap-cargo", "version"])
         .output()
         .expect("ran targo");
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        output.status.success(),
-        "targo failed with stderr:\n{}",
+        output.status.success() && stdout.lines().any(|line| line.starts_with("cargo ")),
+        "targo exited with {}, stdout was:\n{stdout}\nstderr was:\n{}",
+        output.status,
         String::from_utf8_lossy(&output.stderr)
     );
+    output
 }
 
 /// Runs `targo wrap-cargo version` in `workspace_dir`, which must fail and change nothing.

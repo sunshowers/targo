@@ -119,7 +119,16 @@ impl TestEnv {
 
     /// Returns a command for the built `targo` binary, confined to this environment.
     pub(crate) fn targo(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_targo"));
+        self.confined_command(env!("CARGO_BIN_EXE_targo"))
+    }
+
+    /// The real Cargo, confined like targo so that it behaves as targo's Cargo does.
+    pub(crate) fn cargo(&self) -> Command {
+        self.confined_command(env!("CARGO"))
+    }
+
+    fn confined_command(&self, program: &str) -> Command {
+        let mut command = Command::new(program);
         for (name, _) in env::vars_os() {
             let name_str = name.to_string_lossy();
             if SCRUBBED_ENV_PREFIXES

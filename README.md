@@ -20,6 +20,8 @@ To bypass targo, prefix the command with a backslash on the command line (should
 $ \cargo build
 ```
 
+Target directories are stored in `$CARGO_HOME/targo`. To store them somewhere else, set `TARGO_STORE_DIR` to an absolute path. A workspace whose `target` already links into another store keeps using that store until the link is removed.
+
 ## About
 
 See [this comment on rust-lang/cargo](https://github.com/rust-lang/cargo/issues/11156#issuecomment-1285951209) for the execution model and considerations as of 2022-10-22.

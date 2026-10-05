@@ -48,6 +48,9 @@ impl TargoApp {
 }
 
 fn exec_wrap_cargo(args: Vec<OsString>) -> Result<()> {
+    // Checked first so that a bad override fails even when targo is disabled.
+    let store_dir_override = parse_store_dir_override(std::env::var_os(STORE_DIR_ENV))?;
+
     let parsed_args = match WrapCargoArgs::new(args)? {
         WrapCargoArgs::Enabled {
             parsed_args,
@@ -55,7 +58,10 @@ fn exec_wrap_cargo(args: Vec<OsString>) -> Result<()> {
             target_dir,
         } => {
             // Find the target directory destination.
-            let store_dir = find_targo_store_dir()?;
+            let store_dir = match store_dir_override {
+                Some(store_dir) => store_dir,
+                None => default_store_dir()?,
+            };
             let store = TargoStore::new(store_dir)?;
 
             let kind = store.determine_target_dir(&workspace_dir, &target_dir)?;
@@ -213,7 +219,59 @@ impl fmt::Display for ManifestPathError {
 
 impl error::Error for ManifestPathError {}
 
-fn find_targo_store_dir() -> Result<Utf8PathBuf> {
+/// The environment variable that overrides the store directory.
+const STORE_DIR_ENV: &str = "TARGO_STORE_DIR";
+
+/// Returns the store directory named by the value of `TARGO_STORE_DIR`, if the variable is set.
+fn parse_store_dir_override(
+    value: Option<OsString>,
+) -> Result<Option<Utf8PathBuf>, StoreDirEnvError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Err(StoreDirEnvError::Empty);
+    }
+    let store_dir = value
+        .into_string()
+        .map(Utf8PathBuf::from)
+        .map_err(StoreDirEnvError::NotUtf8)?;
+    if !store_dir.is_absolute() {
+        return Err(StoreDirEnvError::NotAbsolute(store_dir));
+    }
+    Ok(Some(store_dir))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum StoreDirEnvError {
+    Empty,
+    NotUtf8(OsString),
+    NotAbsolute(Utf8PathBuf),
+}
+
+impl fmt::Display for StoreDirEnvError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => write!(
+                f,
+                "`{STORE_DIR_ENV}` is set to an empty value: \
+                 set it to an absolute path, or unset it to use the default store"
+            ),
+            Self::NotUtf8(value) => write!(
+                f,
+                "`{STORE_DIR_ENV}` must be valid UTF-8, but is set to {value:?}"
+            ),
+            Self::NotAbsolute(store_dir) => write!(
+                f,
+                "`{STORE_DIR_ENV}` must be an absolute path, but is set to `{store_dir}`"
+            ),
+        }
+    }
+}
+
+impl error::Error for StoreDirEnvError {}
+
+fn default_store_dir() -> Result<Utf8PathBuf> {
     let dir = home::cargo_home().wrap_err("unable to determine cargo home dir")?;
     let mut utf8_dir: Utf8PathBuf = dir
         .clone()
@@ -332,6 +390,33 @@ mod tests {
             let TargoCommand::WrapCargo { args } = app.command;
             assert_eq!(args, input, "clap passes arguments through unchanged");
         }
+    }
+
+    #[test]
+    fn test_parse_store_dir_override() {
+        let not_absolute = |dir: &str| Err(StoreDirEnvError::NotAbsolute(dir.into()));
+        let data = [
+            ("/store", Ok(Some("/store".into()))),
+            ("/my store/", Ok(Some("/my store/".into()))),
+            ("", Err(StoreDirEnvError::Empty)),
+            ("store", not_absolute("store")),
+            ("~/store", not_absolute("~/store")),
+        ];
+        for (input, expected) in data {
+            assert_eq!(
+                parse_store_dir_override(Some(input.into())),
+                expected,
+                "for {input:?}"
+            );
+        }
+
+        assert_eq!(parse_store_dir_override(None), Ok(None));
+
+        let non_utf8 = os_string(b"/store\xff");
+        assert_eq!(
+            parse_store_dir_override(Some(non_utf8.clone())),
+            Err(StoreDirEnvError::NotUtf8(non_utf8))
+        );
     }
 
     fn shell_args(input: &str) -> Vec<OsString> {

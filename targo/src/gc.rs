@@ -328,19 +328,57 @@ fn decide(entry: &RecognizedEntry, now: DateTime<Utc>, policy: &GcPolicy) -> Dec
     Decision::Keep(reason)
 }
 
+/// An I/O error, and the path that it happened at.
+#[derive(Debug)]
+struct PathError {
+    path: PathBuf,
+    error: io::Error,
+}
+
+impl fmt::Display for PathError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "`{}`: {}", self.path.display(), self.error)
+    }
+}
+
+/// The first error that a walk of a tree ran into, and how many more paths had one.
+#[derive(Debug)]
+struct PathErrors {
+    first: PathError,
+    other_paths: u64,
+}
+
+impl PathErrors {
+    fn record(errors: &mut Option<Self>, path: PathBuf, error: io::Error) {
+        match errors {
+            Some(errors) => errors.other_paths += 1,
+            None => {
+                *errors = Some(Self {
+                    first: PathError { path, error },
+                    other_paths: 0,
+                });
+            }
+        }
+    }
+}
+
+impl fmt::Display for PathErrors {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.first)?;
+        match self.other_paths {
+            0 => Ok(()),
+            1 => f.write_str(" (and 1 other path)"),
+            others => write!(f, " (and {others} other paths)"),
+        }
+    }
+}
+
 /// The disk usage of a tree.
 #[derive(Debug)]
 struct DiskUsage {
     bytes: u64,
     /// Set if part of the tree could not be measured, which makes `bytes` a lower bound.
-    unmeasured: Option<UnmeasuredPaths>,
-}
-
-#[derive(Debug)]
-struct UnmeasuredPaths {
-    first_path: PathBuf,
-    first_error: io::Error,
-    other_paths: u64,
+    unmeasured: Option<PathErrors>,
 }
 
 /// Measures the disk usage of the entry `name`, which can take minutes.
@@ -359,7 +397,7 @@ struct UsageWalk {
     bytes: u64,
     /// Device and inode of each file counted so far that has more than one link.
     counted_hard_links: HashSet<(u64, u64)>,
-    unmeasured: Option<UnmeasuredPaths>,
+    unmeasured: Option<PathErrors>,
 }
 
 impl UsageWalk {
@@ -431,16 +469,7 @@ impl UsageWalk {
 
     fn record_unmeasured(&mut self, path: PathBuf, error: io::Error) {
         tracing::debug!("could not measure `{}`: {error}", path.display());
-        match &mut self.unmeasured {
-            Some(unmeasured) => unmeasured.other_paths += 1,
-            None => {
-                self.unmeasured = Some(UnmeasuredPaths {
-                    first_path: path,
-                    first_error: error,
-                    other_paths: 0,
-                });
-            }
-        }
+        PathErrors::record(&mut self.unmeasured, path, error);
     }
 
     fn finish(self) -> DiskUsage {
@@ -494,16 +523,7 @@ fn removal_line(entry: &RecognizedEntry, idle: Duration, usage: &DiskUsage) -> S
         BacklinkList(&entry.backlinks),
     );
     if let Some(unmeasured) = &usage.unmeasured {
-        line.push_str(&format!(
-            "; could not measure `{}`: {}",
-            unmeasured.first_path.display(),
-            unmeasured.first_error,
-        ));
-        match unmeasured.other_paths {
-            0 => {}
-            1 => line.push_str(" (and 1 other path)"),
-            others => line.push_str(&format!(" (and {others} other paths)")),
-        }
+        line.push_str(&format!("; could not measure {unmeasured}"));
     }
     line
 }
@@ -1157,11 +1177,11 @@ mod tests {
         let unmeasured = usage.unmeasured.expect("the size is a lower bound");
         assert!(
             locked_dirs
-                .contains(&Utf8PathBuf::try_from(unmeasured.first_path).expect("path is UTF-8")),
+                .contains(&Utf8PathBuf::try_from(unmeasured.first.path).expect("path is UTF-8")),
             "the first path is one of the unreadable directories"
         );
         assert_eq!(
-            (unmeasured.first_error.kind(), unmeasured.other_paths),
+            (unmeasured.first.error.kind(), unmeasured.other_paths),
             (io::ErrorKind::PermissionDenied, 1)
         );
     }
@@ -1182,9 +1202,11 @@ mod tests {
         for (other_paths, others) in data {
             let lower_bound = DiskUsage {
                 bytes: 1536,
-                unmeasured: Some(UnmeasuredPaths {
-                    first_path: "/store/entry/target/locked".into(),
-                    first_error: io::Error::other("no access"),
+                unmeasured: Some(PathErrors {
+                    first: PathError {
+                        path: "/store/entry/target/locked".into(),
+                        error: io::Error::other("no access"),
+                    },
                     other_paths,
                 }),
             };
@@ -1213,9 +1235,11 @@ mod tests {
 
         total.add(&DiskUsage {
             bytes: 512,
-            unmeasured: Some(UnmeasuredPaths {
-                first_path: "/store/entry".into(),
-                first_error: io::Error::other("no access"),
+            unmeasured: Some(PathErrors {
+                first: PathError {
+                    path: "/store/entry".into(),
+                    error: io::Error::other("no access"),
+                },
                 other_paths: 0,
             }),
         });

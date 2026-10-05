@@ -1,19 +1,28 @@
 use crate::{
-    helpers::{AsLockedCtx, DirWithPath, ExclusiveRoot, UnlockedRoot},
+    helpers::{DirWithPath, ExclusiveLock},
     metadata::{TargetDirMetadata, TargoStoreMetadata},
 };
 use camino::{Utf8Path, Utf8PathBuf};
 use cap_std::{ambient_authority, fs_utf8::Dir};
 use color_eyre::{eyre::Context, Result};
+use std::{fs, io};
 use xxhash_rust::xxh3::xxh3_64;
 
+/// The targo store, with `targo.lock` held exclusively for as long as this value exists.
+///
+/// Everything that modifies the store takes a `LockedStore`.
 #[derive(Debug)]
-pub(crate) struct TargoStore {
+#[must_use]
+pub(crate) struct LockedStore {
     store_dir: DirWithPath,
+    lock: ExclusiveLock,
 }
 
-impl TargoStore {
-    pub(crate) fn new(store_dir_path: Utf8PathBuf) -> Result<Self> {
+impl LockedStore {
+    const LOCK_FILE_NAME: &'static str = "targo.lock";
+
+    /// Opens the store at `store_dir_path`, creating it if needed, and locks it.
+    pub(crate) fn open(store_dir_path: Utf8PathBuf) -> Result<Self> {
         let authority = ambient_authority();
         Dir::create_ambient_dir_all(&store_dir_path, authority).wrap_err_with(|| {
             format!("failed to create targo store directory `{store_dir_path}`")
@@ -22,15 +31,11 @@ impl TargoStore {
             .wrap_err_with(|| format!("failed to open targo store directory `{store_dir_path}`"))?;
         let store_dir = DirWithPath::new(store_dir, store_dir_path);
 
-        let store = Self { store_dir };
-
-        let store = UnlockedRoot::new(store)?.lock_exclusive()?;
-
-        // TODO: hold lock open while TargoStore is held, so per-directory metadata can be written
-        // safely
+        let lock = ExclusiveLock::acquire(&store_dir, Self::LOCK_FILE_NAME)?;
+        let store = Self { store_dir, lock };
 
         // Does the directory already have Targo metadata stored in it?
-        let metadata = Self::read_store_metadata(&store)?;
+        let metadata = store.read_store_metadata()?;
 
         let metadata_to_write = match &metadata {
             Some(metadata) => metadata.upgrade_if_necessary(),
@@ -39,24 +44,42 @@ impl TargoStore {
 
         if let Some(to_write) = metadata_to_write {
             // TODO: also upgrade metadata within the directory if required
-            Self::write_store_metadata(&store, &to_write)?;
+            store.write_store_metadata(&to_write)?;
         }
 
-        Ok(store.unlock())
+        Ok(store)
     }
 
-    pub(crate) fn determine_target_dir(
-        &self,
+    /// Releases the store lock.
+    pub(crate) fn unlock(self) -> Result<()> {
+        self.lock.unlock()
+    }
+
+    /// Points `target_dir` into the store, unless a real directory is in the way.
+    pub(crate) fn set_up_target_dir(
+        self,
         workspace_dir: &Utf8Path,
         target_dir: &Utf8Path,
-    ) -> Result<TargetDirKind> {
+    ) -> Result<TargetDirSetup> {
+        match self.determine_target_dir(target_dir)? {
+            TargetDirKind::DoesNotExist => self.link_target_dir(workspace_dir, target_dir)?,
+            TargetDirKind::Directory => {
+                self.unlock()?;
+                return Ok(TargetDirSetup::DirectoryInTheWay);
+            }
+            TargetDirKind::TargoSymlink { encoded } => {
+                ManagedTargetDir::new(&self, target_dir.to_owned(), &encoded)?;
+            }
+            TargetDirKind::Other => {}
+        }
+        Ok(TargetDirSetup::Done(self))
+    }
+
+    fn determine_target_dir(&self, target_dir: &Utf8Path) -> Result<TargetDirKind> {
         let symlink_metadata = match target_dir.symlink_metadata() {
             Ok(metadata) => metadata,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(TargetDirKind::DoesNotExist {
-                    workspace_dir: workspace_dir.to_owned(),
-                    target_dir: target_dir.to_owned(),
-                })
+                return Ok(TargetDirKind::DoesNotExist)
             }
             Err(err) => {
                 return Err(err).wrap_err_with(|| {
@@ -67,10 +90,7 @@ impl TargoStore {
 
         let kind = if symlink_metadata.is_dir() {
             // This is a directory and is eligible for being converted to Targo.
-            TargetDirKind::Directory {
-                workspace_dir: workspace_dir.to_owned(),
-                target_dir: target_dir.to_owned(),
-            }
+            TargetDirKind::Directory
         } else if symlink_metadata.is_symlink() {
             // TODO: read link in a TOCTTOU-safe manner
             let data = target_dir
@@ -83,8 +103,9 @@ impl TargoStore {
             // Is this a symlink managed by this installation of Targo?
             // (TODO: be able to operate on other installations of Targo maybe?)
             if let Some(encoded) = get_encoded_workspace(self.store_dir.path(), &dest_dir) {
-                let managed_dir = ManagedTargetDir::new(self, target_dir.to_owned(), encoded)?;
-                TargetDirKind::TargoSymlink(managed_dir)
+                TargetDirKind::TargoSymlink {
+                    encoded: encoded.to_owned(),
+                }
             } else {
                 TargetDirKind::Other
             }
@@ -95,110 +116,80 @@ impl TargoStore {
         Ok(kind)
     }
 
-    pub(crate) fn actualize_kind(&self, kind: TargetDirKind) -> Result<Option<ManagedTargetDir>> {
-        match kind {
-            TargetDirKind::DoesNotExist {
-                workspace_dir,
-                target_dir,
-            } => {
-                let managed_dir = self.setup_target_dir(workspace_dir, target_dir, false)?;
-                Ok(Some(managed_dir))
-            }
-            TargetDirKind::Directory {
-                workspace_dir,
-                target_dir,
-            } => {
-                let managed_dir = self.setup_target_dir(workspace_dir, target_dir, true)?;
-                Ok(Some(managed_dir))
-            }
-            TargetDirKind::TargoSymlink(managed_dir) => Ok(Some(managed_dir)),
-            TargetDirKind::Other => Ok(None),
-        }
-    }
-
     // ---
     // Helper methods
     // ---
 
-    fn read_store_metadata(store: &ExclusiveRoot<Self>) -> Result<Option<TargoStoreMetadata>> {
-        let metadata: Option<TargoStoreMetadata> = store
-            .ctx
+    fn read_store_metadata(&self) -> Result<Option<TargoStoreMetadata>> {
+        let metadata: Option<TargoStoreMetadata> = self
             .store_dir
             .read_metadata(TargoStoreMetadata::METADATA_FILE_NAME)?;
         let metadata = if let Some(metadata) = metadata {
-            Some(metadata.verify(store.ctx.store_dir.path())?)
+            Some(metadata.verify(self.store_dir.path())?)
         } else {
             None
         };
         Ok(metadata)
     }
 
-    fn write_store_metadata(
-        store: &ExclusiveRoot<Self>,
-        metadata: &TargoStoreMetadata,
-    ) -> Result<()> {
-        store
-            .ctx
-            .store_dir
+    fn write_store_metadata(&self, metadata: &TargoStoreMetadata) -> Result<()> {
+        self.store_dir
             .write_metadata(TargoStoreMetadata::METADATA_FILE_NAME, metadata)
     }
 
-    fn setup_target_dir(
-        &self,
-        workspace_dir: Utf8PathBuf,
-        target_dir: Utf8PathBuf,
-        exists: bool,
-    ) -> Result<ManagedTargetDir> {
-        if exists {
-            // TODO: do something better than rm -rf target/ here!
-            match std::fs::remove_dir_all(&target_dir) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    // The directory doesn't exist. Skip this.
-                }
-                Err(err) => {
-                    Err::<(), _>(err).wrap_err_with(|| {
-                        format!("failed to remove old target dir `{target_dir}`")
-                    })?;
-                }
-            }
-        }
-
+    fn link_target_dir(&self, workspace_dir: &Utf8Path, target_dir: &Utf8Path) -> Result<()> {
         // Create the managed target directory and symlink.
-        let encoded = encode_workspace_path(&workspace_dir);
-        let managed_dir = ManagedTargetDir::new(self, target_dir, &encoded)?;
+        let encoded = encode_workspace_path(workspace_dir);
+        let managed_dir = ManagedTargetDir::new(self, target_dir.to_owned(), &encoded)?;
 
         // Create the symlink.
         // TODO: Windows
-        std::os::unix::fs::symlink(&managed_dir.target_dir, &managed_dir.source_link)
-            .wrap_err_with(|| {
+        std::os::unix::fs::symlink(&managed_dir.target_dir, &managed_dir.source_link).wrap_err_with(
+            || {
                 format!(
                     "failed to create symlink from `{}` to `{}`",
                     managed_dir.source_link, managed_dir.target_dir
                 )
-            })?;
-
-        Ok(managed_dir)
+            },
+        )
     }
 }
 
-impl AsLockedCtx for TargoStore {
-    fn dir_and_lock_name(&self) -> (&DirWithPath, &str) {
-        (&self.store_dir, "targo.lock")
+/// Removes the real directory at `target_dir`, which can take minutes.
+pub(crate) fn remove_target_dir(target_dir: &Utf8Path) -> Result<()> {
+    // TODO: do something better than rm -rf target/ here!
+    match fs::remove_dir_all(target_dir) {
+        Ok(()) => Ok(()),
+        Err(err) => match err.kind() {
+            // Another process got there first. The caller looks again under the lock.
+            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory => {
+                tracing::debug!("`{target_dir}` was removed or replaced by another process: {err}");
+                Ok(())
+            }
+            _ => {
+                Err(err).wrap_err_with(|| format!("failed to remove old target dir `{target_dir}`"))
+            }
+        },
     }
+}
+
+/// The result of [`LockedStore::set_up_target_dir`].
+#[derive(Debug)]
+#[must_use]
+pub(crate) enum TargetDirSetup {
+    /// The target dir is in the store, or is something targo leaves alone.
+    Done(LockedStore),
+    /// A real directory is in the way. Removing it is slow, so the lock has been released.
+    DirectoryInTheWay,
 }
 
 #[derive(Debug)]
-pub(crate) enum TargetDirKind {
-    DoesNotExist {
-        workspace_dir: Utf8PathBuf,
-        target_dir: Utf8PathBuf,
+enum TargetDirKind {
+    DoesNotExist,
+    Directory,
+    TargoSymlink {
+        encoded: String,
     },
-    Directory {
-        workspace_dir: Utf8PathBuf,
-        target_dir: Utf8PathBuf,
-    },
-    TargoSymlink(ManagedTargetDir),
     /// Includes non-Targo symlinks and other situations that won't be touched.
     Other,
 }
@@ -212,7 +203,7 @@ pub(crate) struct ManagedTargetDir {
 }
 
 impl ManagedTargetDir {
-    fn new(store: &TargoStore, source_link: Utf8PathBuf, encoded: &str) -> Result<Self> {
+    fn new(store: &LockedStore, source_link: Utf8PathBuf, encoded: &str) -> Result<Self> {
         // Create the directory if it doesn't exist.
         let dest_dir_path = store.store_dir.path().join(encoded);
         let target_dir = dest_dir_path.join("target");
@@ -228,27 +219,21 @@ impl ManagedTargetDir {
         })?;
         let dest_dir = DirWithPath::new(dest_dir, dest_dir_path);
 
-        let mut metadata =
-            Self::read_dir_metadata(&dest_dir)?.unwrap_or_else(TargetDirMetadata::new);
+        // A read-modify-write, safe only because `store` holds the lock.
+        let mut metadata = dest_dir
+            .read_metadata(TargetDirMetadata::METADATA_FILE_NAME)?
+            .unwrap_or_else(TargetDirMetadata::new);
         // TODO: check existing backlinks
         metadata.backlinks.insert(source_link.clone());
         metadata.update_last_used();
 
-        Self::write_dir_metadata(&dest_dir, &metadata)?;
+        dest_dir.write_metadata(TargetDirMetadata::METADATA_FILE_NAME, &metadata)?;
 
         Ok(Self {
             source_link,
             dest_dir,
             target_dir,
         })
-    }
-
-    fn read_dir_metadata(dest_dir: &DirWithPath) -> Result<Option<TargetDirMetadata>> {
-        dest_dir.read_metadata(TargetDirMetadata::METADATA_FILE_NAME)
-    }
-
-    fn write_dir_metadata(dest_dir: &DirWithPath, metadata: &TargetDirMetadata) -> Result<()> {
-        dest_dir.write_metadata(TargetDirMetadata::METADATA_FILE_NAME, metadata)
     }
 }
 
@@ -360,6 +345,120 @@ fn truncate_with_hash(encoded: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fs2::FileExt;
+
+    /// A temp dir with paths for a store and a workspace's target dir.
+    struct TestDirs {
+        // Held so that the directory is removed on drop.
+        _temp_dir: camino_tempfile::Utf8TempDir,
+        store_dir: Utf8PathBuf,
+        workspace_dir: Utf8PathBuf,
+        target_dir: Utf8PathBuf,
+    }
+
+    impl TestDirs {
+        fn new() -> Self {
+            let temp_dir = camino_tempfile::tempdir().expect("created temp dir");
+            let root = temp_dir.path();
+            let workspace_dir = root.join("workspace");
+            fs::create_dir(&workspace_dir).expect("created workspace dir");
+            Self {
+                store_dir: root.join("store"),
+                target_dir: workspace_dir.join("target"),
+                workspace_dir,
+                _temp_dir: temp_dir,
+            }
+        }
+
+        fn open_store(&self) -> LockedStore {
+            LockedStore::open(self.store_dir.clone()).expect("opened store")
+        }
+
+        /// Opens the lock file again, so that a lock taken through it conflicts with the store's.
+        fn lock_probe(&self) -> fs::File {
+            fs::File::open(self.store_dir.join(LockedStore::LOCK_FILE_NAME))
+                .expect("opened lock file")
+        }
+
+        fn set_up_target_dir(&self, store: LockedStore) -> TargetDirSetup {
+            store
+                .set_up_target_dir(&self.workspace_dir, &self.target_dir)
+                .expect("set up target dir")
+        }
+    }
+
+    #[test]
+    fn test_store_lock_held_until_unlock() {
+        let dirs = TestDirs::new();
+        let mut store = dirs.open_store();
+        let probe = dirs.lock_probe();
+        assert_contended(&probe, "after the store is opened");
+
+        // First through a missing target dir, then through the symlink the first pass creates.
+        for pass in ["first setup", "second setup"] {
+            store = match dirs.set_up_target_dir(store) {
+                TargetDirSetup::Done(store) => store,
+                TargetDirSetup::DirectoryInTheWay => panic!("{pass} found a real directory"),
+            };
+            assert!(dirs.target_dir.is_symlink(), "{pass} links the target dir");
+            assert_contended(&probe, pass);
+        }
+
+        store.unlock().expect("unlocked store");
+        probe
+            .try_lock_exclusive()
+            .expect("lock is free once the store is unlocked");
+    }
+
+    #[test]
+    fn test_store_unlocks_instead_of_removing_target_dir() {
+        let dirs = TestDirs::new();
+        let old_file = dirs.target_dir.join("old-file");
+        fs::create_dir(&dirs.target_dir).expect("created target dir");
+        fs::write(&old_file, "").expect("wrote old file");
+
+        let store = dirs.open_store();
+        let probe = dirs.lock_probe();
+        match dirs.set_up_target_dir(store) {
+            TargetDirSetup::Done(_) => panic!("a real directory is not set up under the lock"),
+            TargetDirSetup::DirectoryInTheWay => {}
+        }
+        probe
+            .try_lock_exclusive()
+            .expect("lock is free while the directory is still to be removed");
+        assert!(old_file.exists(), "the directory is left to the caller");
+        // The store below blocks on the lock unless the probe lets go of it.
+        drop(probe);
+
+        remove_target_dir(&dirs.target_dir).expect("removed target dir");
+        match dirs.set_up_target_dir(dirs.open_store()) {
+            TargetDirSetup::Done(_) => {}
+            TargetDirSetup::DirectoryInTheWay => panic!("the directory was removed"),
+        }
+        assert!(dirs.target_dir.is_symlink());
+    }
+
+    #[test]
+    fn test_remove_target_dir_leaves_non_directories() {
+        let dirs = TestDirs::new();
+        remove_target_dir(&dirs.target_dir).expect("a missing target dir is fine");
+
+        fs::write(&dirs.target_dir, "").expect("wrote file");
+        remove_target_dir(&dirs.target_dir).expect("a file is left for the caller to look at");
+        assert!(dirs.target_dir.is_file());
+    }
+
+    // A shared probe is contended only by an exclusive lock.
+    fn assert_contended(probe: &fs::File, when: &str) {
+        match FileExt::try_lock_shared(probe) {
+            Ok(()) => panic!("{when}, the store lock is free, but the store should hold it"),
+            Err(error) => assert_eq!(
+                error.raw_os_error(),
+                fs2::lock_contended_error().raw_os_error(),
+                "{when}, taking the store lock fails because it is held: {error}"
+            ),
+        }
+    }
 
     #[test]
     fn test_get_encoded_workspace() {

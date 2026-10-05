@@ -9,92 +9,37 @@ use std::{
     io::{self, Write},
 };
 
+/// An exclusive lock on a lock file, held until it is unlocked or dropped.
 #[derive(Debug)]
-pub(crate) struct UnlockedRoot<T> {
+#[must_use]
+pub(crate) struct ExclusiveLock {
     // Can't use cap_std::fs_utf8::File as it doesn't support fs2 or locking, sadly.
     file: fs::File,
     lock_path: Utf8PathBuf,
-    pub(crate) ctx: T,
 }
 
-impl<T: AsLockedCtx> UnlockedRoot<T> {
-    pub(crate) fn new(ctx: T) -> Result<Self> {
-        let (dir, lock_name) = ctx.dir_and_lock_name();
+impl ExclusiveLock {
+    /// Creates `lock_name` in `dir` if it doesn't exist, and blocks until it is locked.
+    pub(crate) fn acquire(dir: &DirWithPath, lock_name: &str) -> Result<Self> {
         let mut open_opts = cap_std::fs::OpenOptions::new();
-        // Create the file if it doesn't exist.
         open_opts.write(true).create(true);
         let lock_path = dir.path().join(lock_name);
 
+        // cap-std opens with `O_CLOEXEC`, so a process that targo execs never inherits the lock.
         let file = dir
             .dir()
             .open_with(lock_name, &open_opts)
-            .wrap_err_with(|| format!("failed to open lock at `{lock_path}`"))?;
-        Ok(Self {
-            file: file.into_std(),
-            lock_path,
-            ctx,
-        })
+            .wrap_err_with(|| format!("failed to open lock at `{lock_path}`"))?
+            .into_std();
+        file.lock_exclusive()
+            .wrap_err_with(|| format!("failed to obtain exclusive lock at `{lock_path}`"))?;
+        Ok(Self { file, lock_path })
     }
 
-    #[inline]
-    pub(crate) fn lock_exclusive(self) -> Result<ExclusiveRoot<T>> {
-        self.file
-            .lock_exclusive()
-            .wrap_err_with(|| format!("failed to obtain exclusive lock at `{}`", self.lock_path))?;
-        Ok(ExclusiveRoot {
-            file: self.file,
-            ctx: self.ctx,
-        })
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) fn lock_shared(self) -> Result<SharedRoot<T>> {
-        self.file
-            .lock_shared()
-            .wrap_err_with(|| format!("failed to obtain shared lock at `{}`", self.lock_path))?;
-        Ok(SharedRoot {
-            file: self.file,
-            ctx: self.ctx,
-        })
-    }
-}
-
-pub(crate) trait AsLockedCtx {
-    fn dir_and_lock_name(&self) -> (&DirWithPath, &str);
-}
-
-/// Operations that can only be performed on a root where the shared lock has been acquired.
-#[derive(Debug)]
-#[must_use]
-#[allow(dead_code)]
-pub(crate) struct SharedRoot<T> {
-    file: fs::File,
-    pub(crate) ctx: T,
-}
-
-impl<T> SharedRoot<T> {
-    /// Unlock this directory.
-    #[allow(dead_code)]
-    pub(crate) fn unlock(self) -> T {
-        self.ctx
-    }
-}
-
-/// Operations that can only be performed on a root where the exclusive lock has been acquired.
-/// This forms a superset of the operations on the shared root.
-#[derive(Debug)]
-#[must_use]
-#[allow(dead_code)]
-pub(crate) struct ExclusiveRoot<T> {
-    file: fs::File,
-    pub(crate) ctx: T,
-}
-
-impl<T> ExclusiveRoot<T> {
-    /// Unlock this directory.
-    pub(crate) fn unlock(self) -> T {
-        self.ctx
+    /// Releases the lock. Dropping releases it too, but cannot report a failure.
+    pub(crate) fn unlock(self) -> Result<()> {
+        FileExt::unlock(&self.file)
+            .wrap_err_with(|| format!("failed to release lock at `{}`", self.lock_path))
     }
 }
 

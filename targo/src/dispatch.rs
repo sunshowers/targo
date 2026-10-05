@@ -1,5 +1,8 @@
-use crate::{cargo_cli::CargoCli, store::TargoStore};
-use camino::Utf8PathBuf;
+use crate::{
+    cargo_cli::CargoCli,
+    store::{remove_target_dir, LockedStore, TargetDirSetup},
+};
+use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Parser, Subcommand, ValueHint};
 use color_eyre::{
     eyre::{bail, WrapErr},
@@ -62,10 +65,10 @@ fn exec_wrap_cargo(args: Vec<OsString>) -> Result<()> {
                 Some(store_dir) => store_dir,
                 None => default_store_dir()?,
             };
-            let store = TargoStore::new(store_dir)?;
+            let store = set_up_target_dir(store_dir, &workspace_dir, &target_dir)?;
 
-            let kind = store.determine_target_dir(&workspace_dir, &target_dir)?;
-            store.actualize_kind(kind)?;
+            // Cargo must not run under the store lock: a build can take a long time.
+            store.unlock()?;
 
             parsed_args
         }
@@ -75,6 +78,31 @@ fn exec_wrap_cargo(args: Vec<OsString>) -> Result<()> {
     parsed_args.cargo_command().run_or_exec()?;
 
     Ok(())
+}
+
+/// Opens the store and points `target_dir` into it. The store is returned still locked.
+fn set_up_target_dir(
+    store_dir: Utf8PathBuf,
+    workspace_dir: &Utf8Path,
+    target_dir: &Utf8Path,
+) -> Result<LockedStore> {
+    let store = LockedStore::open(store_dir.clone())?;
+    match store.set_up_target_dir(workspace_dir, target_dir)? {
+        TargetDirSetup::Done(store) => return Ok(store),
+        // The store is unlocked here, so a slow removal doesn't block other targo runs.
+        TargetDirSetup::DirectoryInTheWay => remove_target_dir(target_dir)?,
+    }
+
+    let store = LockedStore::open(store_dir)?;
+    match store.set_up_target_dir(workspace_dir, target_dir)? {
+        TargetDirSetup::Done(store) => Ok(store),
+        TargetDirSetup::DirectoryInTheWay => {
+            bail!(
+                "target dir `{target_dir}` was recreated while targo was moving it into the \
+                 store: make sure nothing else is building in this workspace, then try again"
+            );
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

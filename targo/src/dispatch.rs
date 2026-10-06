@@ -15,7 +15,9 @@ use color_eyre::{
 use std::{
     error,
     ffi::{OsStr, OsString},
-    fmt, io, iter,
+    fmt,
+    io::{self, IsTerminal},
+    iter,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     process::{ExitCode, ExitStatus},
@@ -94,7 +96,17 @@ fn parse_max_age(value: &str) -> Result<Duration, String> {
 impl TargoApp {
     pub fn exec(self) -> Result<ExitCode> {
         let filter = EnvFilter::from_env("TARGO_LOG");
-        tracing_subscriber::fmt().with_env_filter(filter).init();
+        // Not stdout, which is for Cargo's output and for gc's report.
+        let mut log = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(io::stderr)
+            // A failed write is reported with `eprintln!`, which then panics.
+            .log_internal_errors(false);
+        // On a terminal the default stands, which is color unless `NO_COLOR` is set.
+        if !io::stderr().is_terminal() {
+            log = log.with_ansi(false);
+        }
+        log.init();
         match self.command {
             TargoCommand::WrapCargo { args } => exec_wrap_cargo(args),
             TargoCommand::Gc {

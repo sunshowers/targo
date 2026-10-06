@@ -3,7 +3,7 @@ use camino::Utf8Path;
 use std::{
     ffi::{OsStr, OsString},
     fs,
-    io::{BufRead, BufReader},
+    io::{self, BufRead, BufReader},
     iter,
     os::unix::{ffi::OsStrExt, fs::symlink},
     process::{Command, Output, Stdio},
@@ -368,14 +368,59 @@ fn wrap_cargo_is_quiet_outside_a_workspace() {
     }
 
     let output = run_wrap_cargo(env.targo().env("TARGO_LOG", "debug"), env.root());
-    let logged = [output.stdout, output.stderr].concat();
-    let logged = String::from_utf8_lossy(&logged);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        logged.contains("disabled for this command: Cargo found no manifest"),
-        "the reason is in the debug log, which was:\n{logged}"
+        stderr.contains(
+            " DEBUG targo::dispatch: disabled for this command: Cargo found no manifest\n"
+        ),
+        "the reason is in the debug log, which was:\n{stderr}"
     );
 
     assert_eq!(env.snapshot(), before, "a disabled run changes nothing");
+}
+
+#[test]
+fn wrap_cargo_logs_to_stderr() {
+    let env = TestEnv::new();
+    let workspace_dir = env.create_workspace("workspace");
+
+    let quiet = run_wrap_cargo(&mut env.targo(), &workspace_dir);
+    // Without `NO_COLOR`, only the check for a terminal keeps color off.
+    let logged = run_wrap_cargo(
+        env.targo().env("TARGO_LOG", "debug").env_remove("NO_COLOR"),
+        &workspace_dir,
+    );
+
+    assert_eq!(
+        String::from_utf8_lossy(&logged.stdout),
+        String::from_utf8_lossy(&quiet.stdout),
+        "the log is kept out of Cargo's output"
+    );
+    assert_eq!(String::from_utf8_lossy(&quiet.stderr), "");
+    let stderr = String::from_utf8_lossy(&logged.stderr);
+    let running = format!(
+        " DEBUG targo::cargo_cli: running command: {} version\n",
+        shell_words::quote(env!("CARGO"))
+    );
+    assert!(
+        stderr.ends_with(&running) && !stderr.contains('\x1b'),
+        "the log is on stderr, uncolored as stderr is not a terminal, and was:\n{stderr}"
+    );
+}
+
+#[test]
+fn wrap_cargo_runs_cargo_when_the_log_cannot_be_written() {
+    let env = TestEnv::new();
+    let workspace_dir = env.create_workspace("workspace");
+    // Closed before targo starts, so every write to stderr fails.
+    let (reader, writer) = io::pipe().expect("created pipe");
+    drop(reader);
+
+    // The helper checks that Cargo ran.
+    run_wrap_cargo(
+        env.targo().env("TARGO_LOG", "debug").stderr(writer),
+        &workspace_dir,
+    );
 }
 
 #[test]

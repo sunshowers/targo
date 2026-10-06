@@ -1656,6 +1656,52 @@ fn gc_dry_run_stops_quietly_when_stdout_is_closed() {
     );
 }
 
+#[test]
+fn gc_dry_run_logs_to_stderr() {
+    let env = TestEnv::new();
+    let store = TestStore::new(&env);
+    let orphan = store.create_entry("orphan", &[], -(8 * DAY + 12 * HOUR));
+    // Gc logs what it can't measure. This is too deep for it to look for a build in.
+    let unreadable = orphan.join("target/debug/deps/unreadable");
+    fs::create_dir_all(&unreadable).expect("created dir");
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000))
+        .expect("removed permissions");
+    let enforced = fs::read_dir(&unreadable).is_err();
+
+    let quiet = run_dry_gc(&env, &[]);
+    let logged = env
+        .targo()
+        .env("TARGO_LOG", "debug")
+        .args(["gc", "--dry-run"])
+        .output()
+        .expect("ran targo");
+    // Before the assertions: the temp dir can't be removed while this is unreadable.
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o755))
+        .expect("restored permissions");
+    if !enforced {
+        eprintln!("skipped: permissions are not enforced for this user");
+        return;
+    }
+
+    let cannot_measure =
+        format!("could not measure `{unreadable}`: Permission denied (os error 13)\n");
+    let report = stdout_of_success(&quiet);
+    assert!(report.contains(&cannot_measure), "stdout was:\n{report}");
+    assert_eq!(
+        (
+            logged.status.code(),
+            String::from_utf8_lossy(&logged.stdout).as_ref()
+        ),
+        (Some(0), report.as_str()),
+        "the log is kept out of the report"
+    );
+    let stderr = String::from_utf8_lossy(&logged.stderr);
+    assert!(
+        stderr.contains(&format!(" DEBUG targo::gc: {cannot_measure}")),
+        "the log is on stderr, which was:\n{stderr}"
+    );
+}
+
 /// A store written by hand, so that entries can have any last-used time.
 pub(crate) struct TestStore {
     pub(crate) dir: Utf8PathBuf,

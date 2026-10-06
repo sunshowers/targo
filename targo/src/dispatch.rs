@@ -3,7 +3,7 @@ use crate::{
     cargo_cli::{CargoCli, CargoOutput},
     gc::{self, GcMode, GcPolicy, GcStatus},
     helpers::resolve_location,
-    store::{remove_target_dir, LockedStore, TargetDirSetup},
+    store::{ensure_store_outside_real_dir, remove_target_dir, LockedStore, TargetDirSetup},
 };
 use camino::{Utf8Path, Utf8PathBuf};
 use chrono::{DateTime, Utc};
@@ -218,7 +218,7 @@ fn set_up_target_dir(
     match store.set_up_target_dir(workspace_dir, target_dir)? {
         TargetDirSetup::Done(store) => return Ok(store),
         // The store is unlocked here, so a slow removal doesn't block other targo runs.
-        TargetDirSetup::DirectoryInTheWay => remove_target_dir(target_dir)?,
+        TargetDirSetup::DirectoryInTheWay => remove_target_dir(store_dir, target_dir)?,
     }
 
     let store = open_store_outside_target_dir(store_dir, target_dir)?;
@@ -279,7 +279,8 @@ fn ensure_store_outside_target_dir(store_dir: &Utf8Path, target_dir: &Utf8Path) 
             );
         }
     }
-    Ok(())
+    // Path text can't tell when two names lead to one directory.
+    ensure_store_outside_real_dir(store_dir, &store_location, target_dir)
 }
 
 /// Formats `path`, along with where it really is if that differs.

@@ -133,6 +133,39 @@ impl TestEnv {
         self.confined_command(env!("CARGO"))
     }
 
+    /// A command that runs `program` in its own mount namespace, with `source` also
+    /// mounted at `mount_point`.
+    pub(crate) fn command_in_namespace_with_bind_mount(
+        &self,
+        source: &Utf8Path,
+        mount_point: &Utf8Path,
+        program: &str,
+    ) -> Command {
+        let mut command = self.confined_command("unshare");
+        command
+            .args(["--user", "--map-root-user", "--mount", "sh", "-c"])
+            .arg(r#"mount --bind "$1" "$2" && shift 2 && exec "$@""#)
+            .args(["sh", source.as_str(), mount_point.as_str()])
+            .arg(program);
+        command
+    }
+
+    /// Whether such a command can run. If not, says that the test is skipped.
+    pub(crate) fn can_bind_mount_in_namespace(
+        &self,
+        source: &Utf8Path,
+        mount_point: &Utf8Path,
+    ) -> bool {
+        let mut probe = self.command_in_namespace_with_bind_mount(source, mount_point, "true");
+        match probe.output() {
+            Ok(output) if output.status.success() => true,
+            Ok(_) | Err(_) => {
+                eprintln!("skipped: this user can't mount in a namespace of its own");
+                false
+            }
+        }
+    }
+
     pub(crate) fn confined_command(&self, program: &str) -> Command {
         let mut command = Command::new(program);
         for (name, _) in env::vars_os() {

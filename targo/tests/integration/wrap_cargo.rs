@@ -1,5 +1,5 @@
 use crate::support::{StoreLockState, TestEnv};
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use std::{
     ffi::{OsStr, OsString},
     fs,
@@ -271,6 +271,201 @@ fn wrap_cargo_refuses_store_through_symlink_in_replaced_target_dir() {
     assert!(
         target_dir.symlink_metadata().is_err(),
         "once the target dir and its symlink are removed, no store is created in its place"
+    );
+}
+
+#[test]
+fn wrap_cargo_refuses_store_inside_target_dir_named_in_another_case() {
+    assert_store_refused_through(TargetDirAlias::OtherCase);
+}
+
+#[test]
+fn wrap_cargo_refuses_store_inside_target_dir_of_bind_mounted_workspace() {
+    assert_store_refused_through(TargetDirAlias::BindMount);
+}
+
+/// A second path to a workspace's `target` that path text can't connect to the first.
+#[derive(Clone, Copy, Debug)]
+enum TargetDirAlias {
+    /// The name in another case, where the filesystem ignores case.
+    OtherCase,
+    /// A bind mount of the workspace, in a mount namespace that only targo is in.
+    BindMount,
+}
+
+impl TargetDirAlias {
+    /// Makes a workspace that has the alias. Returns `None`, and says why, where it can't.
+    fn create_workspace(self, env: &TestEnv) -> Option<Utf8PathBuf> {
+        let workspace_dir = env.create_workspace("workspace");
+        match self {
+            Self::OtherCase => {
+                let probe = env.root().join("case-probe");
+                fs::write(&probe, "").expect("wrote probe");
+                let ignores_case = env.root().join("CASE-PROBE").exists();
+                fs::remove_file(&probe).expect("removed probe");
+                if !ignores_case {
+                    eprintln!("skipped: the temp dir is on a case-sensitive filesystem");
+                    return None;
+                }
+            }
+            Self::BindMount => {
+                let mount_point = Self::mount_point(env);
+                fs::create_dir(&mount_point).expect("created mount point");
+                if !env.can_bind_mount_in_namespace(&workspace_dir, &mount_point) {
+                    return None;
+                }
+            }
+        }
+        Some(workspace_dir)
+    }
+
+    fn target_dir(self, env: &TestEnv, workspace_dir: &Utf8Path) -> Utf8PathBuf {
+        match self {
+            Self::OtherCase => workspace_dir.join("TARGET"),
+            Self::BindMount => Self::mount_point(env).join("target"),
+        }
+    }
+
+    fn targo(self, env: &TestEnv, workspace_dir: &Utf8Path) -> Command {
+        self.command(env, workspace_dir, env!("CARGO_BIN_EXE_targo"))
+    }
+
+    fn command(self, env: &TestEnv, workspace_dir: &Utf8Path, program: &str) -> Command {
+        match self {
+            Self::OtherCase => env.confined_command(program),
+            Self::BindMount => env.command_in_namespace_with_bind_mount(
+                workspace_dir,
+                &Self::mount_point(env),
+                program,
+            ),
+        }
+    }
+
+    fn mount_point(env: &TestEnv) -> Utf8PathBuf {
+        env.root().join("mounted-workspace")
+    }
+}
+
+fn assert_store_refused_through(alias: TargetDirAlias) {
+    let scenarios: [fn(TargetDirAlias, &TestEnv, &Utf8Path); 3] = [
+        assert_no_store_is_created_in_a_real_target_dir,
+        assert_store_of_another_workspace_is_kept,
+        assert_store_that_made_the_target_dir_is_kept,
+    ];
+    for scenario in scenarios {
+        let env = TestEnv::new();
+        let Some(workspace_dir) = alias.create_workspace(&env) else {
+            return;
+        };
+        scenario(alias, &env, &workspace_dir);
+    }
+}
+
+fn assert_no_store_is_created_in_a_real_target_dir(
+    alias: TargetDirAlias,
+    env: &TestEnv,
+    workspace_dir: &Utf8Path,
+) {
+    let target_dir = workspace_dir.join("target");
+    fs::create_dir(&target_dir).expect("created target dir");
+    fs::write(target_dir.join("old-file"), "").expect("wrote old file");
+    let target_alias = alias.target_dir(env, workspace_dir);
+    let store_dir = target_alias.join("store");
+
+    assert_store_refused(
+        env,
+        alias
+            .targo(env, workspace_dir)
+            .env("TARGO_STORE_DIR", &store_dir),
+        workspace_dir,
+        &format!("`{store_dir}`"),
+        &format!("`{target_dir}` (the same directory as `{target_alias}`)"),
+    );
+}
+
+fn assert_store_of_another_workspace_is_kept(
+    alias: TargetDirAlias,
+    env: &TestEnv,
+    workspace_dir: &Utf8Path,
+) {
+    let other_dir = env.create_workspace("other");
+    let target_dir = workspace_dir.join("target");
+    let store_location = target_dir.join("store");
+    run_wrap_cargo(
+        env.targo().env("TARGO_STORE_DIR", &store_location),
+        &other_dir,
+    );
+    assert_linked_into_store(&other_dir, &store_location);
+    let built_file = other_dir.join("target/built-file");
+    fs::write(&built_file, "").expect("wrote file through the symlink");
+    let store_dir = alias.target_dir(env, workspace_dir).join("store");
+
+    assert_store_refused(
+        env,
+        alias
+            .targo(env, workspace_dir)
+            .env("TARGO_STORE_DIR", &store_dir),
+        workspace_dir,
+        &format!("`{store_dir}`"),
+        &format!("`{target_dir}` (the same directory as `{store_dir}/..`)"),
+    );
+    assert!(built_file.is_file(), "the other workspace's entry survives");
+}
+
+fn assert_store_that_made_the_target_dir_is_kept(
+    alias: TargetDirAlias,
+    env: &TestEnv,
+    workspace_dir: &Utf8Path,
+) {
+    let target_dir = workspace_dir.join("target");
+    let store_dir = alias.target_dir(env, workspace_dir).join("store");
+
+    assert_refusal(
+        alias
+            .targo(env, workspace_dir)
+            .env("TARGO_STORE_DIR", &store_dir),
+        workspace_dir,
+        &format!("`{store_dir}`"),
+        &format!("`{target_dir}` (the same directory as `{store_dir}/..`)"),
+    );
+    assert!(
+        target_dir.join("store/targo-metadata.json").is_file(),
+        "the store that the run created is not removed along with the target dir"
+    );
+}
+
+#[test]
+fn wrap_cargo_refuses_store_under_bind_mount_of_directory_inside_target_dir() {
+    let env = TestEnv::new();
+    let workspace_dir = env.create_workspace("workspace");
+    let target_dir = workspace_dir.join("target");
+    let inner_dir = target_dir.join("inner");
+    let old_file = target_dir.join("old-file");
+    let mount_point = env.root().join("mounted-inner");
+    fs::create_dir_all(&inner_dir).expect("created target dir");
+    fs::write(&old_file, "").expect("wrote old file");
+    fs::create_dir(&mount_point).expect("created mount point");
+    if !env.can_bind_mount_in_namespace(&inner_dir, &mount_point) {
+        return;
+    }
+    // Walking up from here leaves the mount at its root, without reaching the target dir.
+    let store_dir = mount_point.join("store");
+    let store_location = inner_dir.join("store");
+
+    assert_refusal(
+        env.command_in_namespace_with_bind_mount(
+            &inner_dir,
+            &mount_point,
+            env!("CARGO_BIN_EXE_targo"),
+        )
+        .env("TARGO_STORE_DIR", &store_dir),
+        &workspace_dir,
+        &format!("`{store_dir}`"),
+        &format!("`{target_dir}` (`{store_dir}` is the same directory as `{store_location}`)"),
+    );
+    assert!(
+        store_location.join("targo-metadata.json").is_file() && old_file.is_file(),
+        "neither the store that the run created nor anything else in the target dir is removed"
     );
 }
 

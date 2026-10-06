@@ -713,24 +713,13 @@ fn gc_deletes_nothing_under_a_mount_point_on_the_store_filesystem() {
     fs::create_dir(same_filesystem_dir).expect("created dir");
     fs::write(&same_filesystem_file, "").expect("wrote file");
 
-    let in_private_mount_namespace = |program: &str| {
-        let mut command = env.confined_command("unshare");
-        command
-            .args(["--user", "--map-root-user", "--mount", "sh", "-c"])
-            .arg(r#"mount --bind "$1" "$2" && shift 2 && exec "$@""#)
-            .args(["sh", same_filesystem_dir.as_str(), mount_point.as_str()])
-            .arg(program);
-        command
-    };
-    match in_private_mount_namespace("true").output() {
-        Ok(output) if output.status.success() => {}
-        Ok(_) | Err(_) => {
-            eprintln!("skipped: this user can't mount in a namespace of its own");
-            return;
-        }
+    if !env.can_bind_mount_in_namespace(same_filesystem_dir, &mount_point) {
+        return;
     }
 
-    let output = in_private_mount_namespace(env!("CARGO_BIN_EXE_targo"))
+    let targo = env!("CARGO_BIN_EXE_targo");
+    let output = env
+        .command_in_namespace_with_bind_mount(same_filesystem_dir, &mount_point, targo)
         .arg("gc")
         .output()
         .expect("ran targo");

@@ -1,5 +1,9 @@
 use crate::{
-    helpers::{DirWithPath, ExclusiveLock, TryLock},
+    dispatch::STORE_DIR_ENV,
+    helpers::{
+        deepest_existing, find_dir_at_or_above, find_dir_at_or_below, DirIdentity, DirWithPath,
+        ExclusiveLock, TryLock,
+    },
     metadata::{TargetDirMetadata, TargoStoreMetadata},
 };
 use camino::{Utf8Path, Utf8PathBuf};
@@ -8,7 +12,7 @@ use color_eyre::{
     eyre::{bail, Context},
     Report, Result,
 };
-use std::{ffi::OsString, fmt, fs, io, os::unix::fs::MetadataExt as _};
+use std::{ffi::OsString, fmt, fs, io, os::unix::fs::MetadataExt as _, path::Path};
 use xxhash_rust::xxh3::xxh3_64;
 
 /// The targo store, with `targo.lock` held exclusively for as long as this value exists.
@@ -421,7 +425,27 @@ impl fmt::Display for UnrecognizedReason {
 }
 
 /// Removes the real directory at `target_dir`, which can take minutes.
-pub(crate) fn remove_target_dir(target_dir: &Utf8Path) -> Result<()> {
+/// Fails, removing nothing, if the store at `store_dir` is inside it.
+pub(crate) fn remove_target_dir(store_dir: &Utf8Path, target_dir: &Utf8Path) -> Result<()> {
+    let Some(target_identity) = real_dir_identity(target_dir)? else {
+        tracing::debug!("`{target_dir}` is not a real directory any more, so it is left alone");
+        return Ok(());
+    };
+    // By device and inode: path text can't tell when two names lead to one directory.
+    ensure_store_outside_dir_with_identity(
+        store_dir,
+        store_dir.as_std_path(),
+        target_dir,
+        target_identity,
+    )?;
+    // A mount of a directory inside can hold the store without `target_dir` being above it.
+    ensure_store_not_below_dir(store_dir, target_dir)?;
+    // The search can be slow, and what is removed must be what was checked.
+    if real_dir_identity(target_dir)? != Some(target_identity) {
+        tracing::debug!("`{target_dir}` was replaced while it was checked, so it is left alone");
+        return Ok(());
+    }
+
     // TODO: do something better than rm -rf target/ here!
     match fs::remove_dir_all(target_dir) {
         Ok(()) => Ok(()),
@@ -436,6 +460,82 @@ pub(crate) fn remove_target_dir(target_dir: &Utf8Path) -> Result<()> {
             }
         },
     }
+}
+
+/// Fails if a real directory at `target_dir` holds the store, going by device and inode.
+/// `store_location` is the store directory, or where it would be created.
+pub(crate) fn ensure_store_outside_real_dir(
+    store_dir: &Utf8Path,
+    store_location: &Path,
+    target_dir: &Utf8Path,
+) -> Result<()> {
+    match real_dir_identity(target_dir)? {
+        Some(target_identity) => ensure_store_outside_dir_with_identity(
+            store_dir,
+            store_location,
+            target_dir,
+            target_identity,
+        ),
+        None => Ok(()),
+    }
+}
+
+/// The identity of the real directory at `target_dir`, if one is there.
+fn real_dir_identity(target_dir: &Utf8Path) -> Result<Option<DirIdentity>> {
+    let metadata = match target_dir.symlink_metadata() {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err)
+                .wrap_err_with(|| format!("failed to read metadata for target dir `{target_dir}`"))
+        }
+    };
+    Ok(metadata.is_dir().then(|| DirIdentity::new(&metadata)))
+}
+
+fn ensure_store_outside_dir_with_identity(
+    store_dir: &Utf8Path,
+    store_location: &Path,
+    target_dir: &Utf8Path,
+    target_identity: DirIdentity,
+) -> Result<()> {
+    let same_dir = find_dir_at_or_above(store_location, target_identity)
+        .wrap_err_with(|| check_error(store_dir, target_dir))?;
+    if let Some(same_dir) = same_dir {
+        bail!(
+            "targo store directory `{store_dir}` must be outside target dir `{target_dir}` (the \
+             same directory as `{}`), where it would be deleted along with build output: set \
+             `{STORE_DIR_ENV}` to a directory somewhere else",
+            same_dir.display(),
+        );
+    }
+    Ok(())
+}
+
+/// Fails if the store, or the directory it would be created in, is one of the directories
+/// that removing `target_dir` removes.
+fn ensure_store_not_below_dir(store_dir: &Utf8Path, target_dir: &Utf8Path) -> Result<()> {
+    let (store_location, store_identity) = deepest_existing(store_dir.as_std_path())
+        .wrap_err_with(|| check_error(store_dir, target_dir))?;
+    let same_dir = find_dir_at_or_below(target_dir.as_std_path(), store_identity)
+        .wrap_err_with(|| check_error(store_dir, target_dir))?;
+    if let Some(same_dir) = same_dir {
+        bail!(
+            "targo store directory `{store_dir}` must be outside target dir `{target_dir}` (`{}` \
+             is the same directory as `{}`), where it would be deleted along with build output: \
+             set `{STORE_DIR_ENV}` to a directory somewhere else",
+            store_location.display(),
+            same_dir.display(),
+        );
+    }
+    Ok(())
+}
+
+fn check_error(store_dir: &Utf8Path, target_dir: &Utf8Path) -> String {
+    format!(
+        "failed to check that targo store directory `{store_dir}` is outside target dir \
+         `{target_dir}`, which is left in place"
+    )
 }
 
 /// The result of [`LockedStore::set_up_target_dir`].
@@ -613,7 +713,10 @@ mod tests {
     use crate::helpers::tests::open_lock_file;
     use std::{
         fs::TryLockError,
-        os::unix::{ffi::OsStringExt, fs::symlink},
+        os::unix::{
+            ffi::OsStringExt,
+            fs::{symlink, PermissionsExt},
+        },
     };
 
     /// A temp dir with paths for a store and a workspace's target dir.
@@ -699,7 +802,7 @@ mod tests {
         // The store below blocks on the lock unless the probe lets go of it.
         drop(probe);
 
-        remove_target_dir(&dirs.target_dir).expect("removed target dir");
+        remove_target_dir(&dirs.store_dir, &dirs.target_dir).expect("removed target dir");
         match dirs.set_up_target_dir(dirs.open_store()) {
             TargetDirSetup::Done(_) => {}
             TargetDirSetup::DirectoryInTheWay => panic!("the directory was removed"),
@@ -710,11 +813,173 @@ mod tests {
     #[test]
     fn test_remove_target_dir_leaves_non_directories() {
         let dirs = TestDirs::new();
-        remove_target_dir(&dirs.target_dir).expect("a missing target dir is fine");
+        remove_target_dir(&dirs.store_dir, &dirs.target_dir).expect("a missing target dir is fine");
 
         fs::write(&dirs.target_dir, "").expect("wrote file");
-        remove_target_dir(&dirs.target_dir).expect("a file is left for the caller to look at");
+        remove_target_dir(&dirs.store_dir, &dirs.target_dir)
+            .expect("a file is left for the caller to look at");
         assert!(dirs.target_dir.is_file());
+
+        fs::remove_file(&dirs.target_dir).expect("removed file");
+        let linked_file = dirs.workspace_dir.join("linked/file");
+        fs::create_dir(dirs.workspace_dir.join("linked")).expect("created dir");
+        fs::write(&linked_file, "").expect("wrote file");
+        symlink("linked", &dirs.target_dir).expect("created symlink");
+        remove_target_dir(&dirs.store_dir, &dirs.target_dir)
+            .expect("a symlink is left for the caller to look at");
+        assert!(dirs.target_dir.is_symlink() && linked_file.is_file());
+    }
+
+    #[test]
+    fn test_remove_target_dir_refuses_a_directory_that_holds_the_store() {
+        let data = [
+            (StoreState::Created, "workspace/target", "workspace/target"),
+            (
+                StoreState::Created,
+                "workspace/target/nested/store",
+                "workspace/target/nested/store/../..",
+            ),
+            (StoreState::Created, "alias/store", "alias/store/../.."),
+            (
+                StoreState::Missing,
+                "workspace/target/nested/missing/store",
+                "workspace/target/nested/..",
+            ),
+            (StoreState::Missing, "alias/missing/store", "alias/.."),
+        ];
+        for (store_state, store_dir, same_dir) in data {
+            let dirs = TestDirs::new();
+            let root = dirs.workspace_dir.parent().expect("workspace has a parent");
+            let old_file = dirs.target_dir.join("old-file");
+            fs::create_dir_all(dirs.target_dir.join("nested")).expect("created target dir");
+            fs::write(&old_file, "").expect("wrote old file");
+            symlink("workspace/target/nested", root.join("alias")).expect("created symlink");
+            let store_dir = root.join(store_dir);
+            match store_state {
+                StoreState::Created => fs::create_dir_all(&store_dir).expect("created store dir"),
+                StoreState::Missing => {}
+            }
+
+            let error = remove_target_dir(&store_dir, &dirs.target_dir)
+                .expect_err("the directory is not removed");
+            let expected = format!(
+                "targo store directory `{store_dir}` must be outside target dir `{}` (the same \
+                 directory as `{}`), where it would be deleted along with build output: set \
+                 `TARGO_STORE_DIR` to a directory somewhere else",
+                dirs.target_dir,
+                root.join(same_dir),
+            );
+            assert_eq!(error.to_string(), expected, "for `{store_dir}`");
+            assert!(old_file.is_file(), "for `{store_dir}`, nothing is removed");
+            match store_state {
+                StoreState::Created => assert!(store_dir.is_dir(), "`{store_dir}` is kept"),
+                StoreState::Missing => {}
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum StoreState {
+        Created,
+        Missing,
+    }
+
+    #[test]
+    fn test_store_is_looked_for_below_the_target_dir() {
+        let data = [
+            (
+                StoreState::Created,
+                "alias/store",
+                "alias/store",
+                Some("workspace/target/nested/store"),
+            ),
+            (
+                StoreState::Missing,
+                "alias/missing/store",
+                "alias",
+                Some("workspace/target/nested"),
+            ),
+            (StoreState::Created, "store", "store", None),
+            (StoreState::Missing, "workspace/store", "workspace", None),
+        ];
+        for (store_state, store_dir, existing, same_dir) in data {
+            let dirs = TestDirs::new();
+            let root = dirs.workspace_dir.parent().expect("workspace has a parent");
+            fs::create_dir_all(dirs.target_dir.join("nested")).expect("created target dir");
+            symlink("workspace/target/nested", root.join("alias")).expect("created symlink");
+            let store_dir = root.join(store_dir);
+            match store_state {
+                StoreState::Created => fs::create_dir_all(&store_dir).expect("created store dir"),
+                StoreState::Missing => {}
+            }
+
+            let result = ensure_store_not_below_dir(&store_dir, &dirs.target_dir);
+            let expected = same_dir.map(|same_dir| {
+                format!(
+                    "targo store directory `{store_dir}` must be outside target dir `{}` (`{}` \
+                     is the same directory as `{}`), where it would be deleted along with build \
+                     output: set `TARGO_STORE_DIR` to a directory somewhere else",
+                    dirs.target_dir,
+                    root.join(existing),
+                    root.join(same_dir),
+                )
+            });
+            assert_eq!(
+                result.err().map(|error| error.to_string()),
+                expected,
+                "for `{store_dir}`"
+            );
+        }
+    }
+
+    #[test]
+    fn test_remove_target_dir_removes_nothing_unless_the_store_is_known_to_be_outside() {
+        let data = [
+            ("unsearchable", "read metadata for", "unsearchable/store"),
+            (
+                "unsearchable/store",
+                "read metadata for",
+                "unsearchable/store/..",
+            ),
+            (
+                "workspace/target/unreadable",
+                "read directory",
+                "workspace/target/unreadable",
+            ),
+        ];
+        for (locked_dir, failed_to, failed_at) in data {
+            let dirs = TestDirs::new();
+            let root = dirs.workspace_dir.parent().expect("workspace has a parent");
+            let old_file = dirs.target_dir.join("old-file");
+            fs::create_dir(&dirs.target_dir).expect("created target dir");
+            fs::write(&old_file, "").expect("wrote old file");
+            let store_dir = root.join("unsearchable/store");
+            fs::create_dir_all(&store_dir).expect("created store dir");
+            let locked_dir = root.join(locked_dir);
+            fs::create_dir_all(&locked_dir).expect("created dir");
+
+            fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o000))
+                .expect("removed permissions");
+            let permissions_enforced = fs::read_dir(&locked_dir).is_err();
+            let result = remove_target_dir(&store_dir, &dirs.target_dir);
+            fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o755))
+                .expect("restored permissions");
+            if !permissions_enforced {
+                eprintln!("skipped: permissions are not enforced for this user");
+                return;
+            }
+
+            let error = result.expect_err("the directory is not removed");
+            let expected = format!(
+                "failed to check that targo store directory `{store_dir}` is outside target dir \
+                 `{}`, which is left in place: failed to {failed_to} `{}`: Permission denied (os \
+                 error 13)",
+                dirs.target_dir,
+                root.join(failed_at),
+            );
+            assert_eq!(format!("{error:#}"), expected, "for `{locked_dir}`");
+            assert!(old_file.is_file(), "for `{locked_dir}`, nothing is removed");
+        }
     }
 
     #[test]

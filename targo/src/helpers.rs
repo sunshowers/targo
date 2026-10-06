@@ -10,7 +10,8 @@ use std::{
     fmt,
     fs::{self, TryLockError},
     io::{self, Write},
-    path::PathBuf,
+    os::unix::fs::MetadataExt as _,
+    path::{Path, PathBuf},
 };
 
 /// An exclusive lock on a lock file, held until it is unlocked or dropped.
@@ -185,10 +186,127 @@ pub(crate) fn resolve_location(path: &Utf8Path) -> Result<PathBuf> {
     Ok(location)
 }
 
+/// The device and inode of a directory: the same whatever path leads to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DirIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+impl DirIdentity {
+    pub(crate) fn new(metadata: &fs::Metadata) -> Self {
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }
+    }
+}
+
+/// Looks for the directory `identity` at `path` or above it, and returns a path to it.
+/// If `path` doesn't exist, the search starts at the deepest directory above it that does.
+pub(crate) fn find_dir_at_or_above(path: &Path, identity: DirIdentity) -> Result<Option<PathBuf>> {
+    let (mut dir, mut dir_identity) = deepest_existing(path)?;
+    loop {
+        if dir_identity == identity {
+            return Ok(Some(dir));
+        }
+        // Not `parent()`: the OS takes `..` from the directory itself, whatever path led there.
+        let os_resolved_parent = dir.join("..");
+        let parent_identity = read_identity(&os_resolved_parent)?;
+        // Only the root is its own parent.
+        let dir_is_root = parent_identity == dir_identity;
+        if dir_is_root {
+            return Ok(None);
+        }
+        (dir, dir_identity) = (os_resolved_parent, parent_identity);
+    }
+}
+
+/// Looks for the directory `identity` at `root` or below it, and returns a path to it.
+/// Symlinks are not followed: this sees the directories that removing `root` would remove.
+pub(crate) fn find_dir_at_or_below(root: &Path, identity: DirIdentity) -> Result<Option<PathBuf>> {
+    let Some(root_metadata) =
+        unless_missing(fs::symlink_metadata(root)).wrap_err_with(|| metadata_error(root))?
+    else {
+        return Ok(None);
+    };
+    if !root_metadata.is_dir() {
+        return Ok(None);
+    }
+    if DirIdentity::new(&root_metadata) == identity {
+        return Ok(Some(root.to_owned()));
+    }
+
+    let mut pending = vec![root.to_owned()];
+    while let Some(dir) = pending.pop() {
+        let read_error = || format!("failed to read directory `{}`", dir.display());
+        let Some(entries) = unless_missing(fs::read_dir(&dir)).wrap_err_with(read_error)? else {
+            continue;
+        };
+        for entry in entries {
+            let Some(entry) = unless_missing(entry).wrap_err_with(read_error)? else {
+                // The directory was removed while it was being read.
+                break;
+            };
+            let path = entry.path();
+            // Only directories are stat'ed: a target directory can hold millions of files.
+            let Some(file_type) =
+                unless_missing(entry.file_type()).wrap_err_with(|| metadata_error(&path))?
+            else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let Some(metadata) =
+                unless_missing(entry.metadata()).wrap_err_with(|| metadata_error(&path))?
+            else {
+                continue;
+            };
+            if DirIdentity::new(&metadata) == identity {
+                return Ok(Some(path));
+            }
+            pending.push(path);
+        }
+    }
+    Ok(None)
+}
+
+/// Something removed during a search is not there to find.
+fn unless_missing<T>(result: io::Result<T>) -> io::Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// Returns the deepest of `path` and its ancestors that exists, with its identity.
+pub(crate) fn deepest_existing(path: &Path) -> Result<(PathBuf, DirIdentity)> {
+    for ancestor in path.ancestors() {
+        match fs::metadata(ancestor) {
+            Ok(metadata) => return Ok((ancestor.to_owned(), DirIdentity::new(&metadata))),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err).wrap_err_with(|| metadata_error(ancestor)),
+        }
+    }
+    // Only a relative path gets here: the root always exists.
+    bail!("nothing exists at or above `{}`", path.display());
+}
+
+fn read_identity(path: &Path) -> Result<DirIdentity> {
+    let metadata = fs::metadata(path).wrap_err_with(|| metadata_error(path))?;
+    Ok(DirIdentity::new(&metadata))
+}
+
+fn metadata_error(path: &Path) -> String {
+    format!("failed to read metadata for `{}`", path.display())
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use std::{os::unix::fs::symlink, path::Path};
+    use std::os::unix::fs::symlink;
 
     /// Opens a lock file to probe or hold its lock.
     pub(crate) fn open_lock_file(path: impl AsRef<Path>) -> fs::File {
@@ -263,6 +381,177 @@ pub(crate) mod tests {
         for (input, expected) in error_data {
             let error = resolve_location(&root.join(input)).expect_err("resolution failed");
             assert_eq!(error.to_string(), expected, "for {input:?}");
+        }
+    }
+
+    fn identity_of(path: &Path) -> DirIdentity {
+        DirIdentity::new(&fs::metadata(path).expect("read metadata"))
+    }
+
+    #[test]
+    fn test_find_dir_at_or_above() {
+        let temp_dir = camino_tempfile::tempdir().expect("created temp dir");
+        let root = temp_dir.path().canonicalize().expect("canonicalized");
+        let root = root.join("a/b/c");
+        fs::create_dir_all(root.join("dir/one/two")).expect("created dirs");
+        fs::create_dir_all(root.join("beside/dir")).expect("created dirs");
+        fs::write(root.join("file"), "").expect("wrote file");
+        symlink(root.join("dir/one/two"), root.join("beside/link")).expect("created symlink");
+
+        let dir_identity = identity_of(&root.join("dir"));
+        let data = [
+            ("dir", Some("dir")),
+            ("dir/one/two", Some("dir/one/two/../..")),
+            (
+                "dir/one/two/../../../dir/one",
+                Some("dir/one/two/../../../dir/one/.."),
+            ),
+            ("dir/one/missing/store", Some("dir/one/..")),
+            ("beside", None),
+            ("beside/dir", None),
+            ("beside/missing/store", None),
+            ("dir/one/two/../../../beside", None),
+            ("missing", None),
+            ("beside/link", Some("beside/link/../..")),
+            ("beside/link/missing/store", Some("beside/link/../..")),
+        ];
+        for (path, expected) in data {
+            let found = find_dir_at_or_above(&root.join(path), dir_identity).expect("searched");
+            assert_eq!(found, expected.map(|path| root.join(path)), "for {path:?}");
+        }
+
+        let found = find_dir_at_or_above(&root.join("dir/missing/../../beside"), dir_identity)
+            .expect("searched");
+        assert_eq!(
+            found,
+            Some(root.join("dir")),
+            "a `..` after a missing component is not followed"
+        );
+
+        let found =
+            find_dir_at_or_above(&root.join("beside/link"), identity_of(&root)).expect("searched");
+        assert_eq!(
+            found,
+            Some(root.join("beside/link/../../..")),
+            "`..` after a symlink is the parent of where the symlink leads"
+        );
+        let found =
+            find_dir_at_or_above(&root.join("beside/link"), identity_of(&root.join("beside")))
+                .expect("searched");
+        assert_eq!(
+            found, None,
+            "the directory that holds a symlink is not above where it leads"
+        );
+
+        let depth = root.components().count() - 1;
+        for (levels, what) in [(depth, "the root"), (depth - 1, "a child of the root")] {
+            let ancestor = root
+                .ancestors()
+                .nth(levels)
+                .expect("the temp dir is this deep");
+            let found = find_dir_at_or_above(&root, identity_of(ancestor))
+                .expect("searched")
+                .unwrap_or_else(|| panic!("{what}, `{}`, is found", ancestor.display()));
+            assert!(
+                found.starts_with(&root) && identity_of(&found) == identity_of(ancestor),
+                "for {what}, `{}` was found at `{}`",
+                ancestor.display(),
+                found.display()
+            );
+        }
+
+        let error_data = [
+            (
+                root.join("file/store"),
+                format!(
+                    "failed to read metadata for `{}`",
+                    root.join("file/store").display()
+                ),
+            ),
+            (
+                root.join("file"),
+                format!(
+                    "failed to read metadata for `{}`",
+                    root.join("file/..").display()
+                ),
+            ),
+            (
+                PathBuf::from("missing/relative"),
+                "nothing exists at or above `missing/relative`".to_owned(),
+            ),
+        ];
+        for (path, expected) in error_data {
+            let error = find_dir_at_or_above(&path, dir_identity).expect_err("the search failed");
+            assert_eq!(error.to_string(), expected, "for `{}`", path.display());
+        }
+    }
+
+    #[test]
+    fn test_find_dir_at_or_below() {
+        let temp_dir = camino_tempfile::tempdir().expect("created temp dir");
+        let root = temp_dir.path().canonicalize().expect("canonicalized");
+        let root = root.join("a/b/c");
+        fs::create_dir_all(root.join("dir/one/two")).expect("created dirs");
+        fs::create_dir_all(root.join("dir/other")).expect("created dirs");
+        fs::create_dir_all(root.join("beside/dir")).expect("created dirs");
+        fs::write(root.join("dir/one/file"), "").expect("wrote file");
+        symlink(root.join("dir/one/two"), root.join("beside/link")).expect("created symlink");
+        symlink(root.join("beside"), root.join("dir/link")).expect("created symlink");
+
+        let data = [
+            ("dir", "dir", Some("dir")),
+            ("dir", "dir/one/two", Some("dir/one/two")),
+            ("dir", "dir/other", Some("dir/other")),
+            ("dir/one", "dir", None),
+            ("dir", "beside", None),
+            ("dir", "beside/dir", None),
+            ("beside", "dir/one/two", None),
+            ("beside/link", "dir/one/two", None),
+            ("dir/one/file", "dir", None),
+            ("missing", "dir", None),
+        ];
+        for (start, sought, expected) in data {
+            let found = find_dir_at_or_below(&root.join(start), identity_of(&root.join(sought)))
+                .expect("searched");
+            assert_eq!(
+                found,
+                expected.map(|path| root.join(path)),
+                "for {sought:?} at or below {start:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dir_identity_includes_the_device() {
+        let temp_dir = camino_tempfile::tempdir().expect("created temp dir");
+        let root = temp_dir.path().canonicalize().expect("canonicalized");
+        let root = root.join("a/b/c");
+        fs::create_dir_all(root.join("dir/one")).expect("created dirs");
+
+        let metadata = fs::metadata(root.join("dir")).expect("read metadata");
+        let on_this_device = DirIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        };
+        let on_another_device = DirIdentity {
+            dev: metadata.dev().wrapping_add(1),
+            ino: metadata.ino(),
+        };
+        let data = [
+            (on_this_device, Some("dir/one/.."), Some("dir")),
+            (on_another_device, None, None),
+        ];
+        for (identity, expected_above, expected_below) in data {
+            let above = find_dir_at_or_above(&root.join("dir/one"), identity).expect("searched");
+            let below = find_dir_at_or_below(&root, identity).expect("searched");
+            assert_eq!(
+                (above, below),
+                (
+                    expected_above.map(|path| root.join(path)),
+                    expected_below.map(|path| root.join(path)),
+                ),
+                "for {identity:?}"
+            );
         }
     }
 }

@@ -1,11 +1,10 @@
 use crate::{
     gc::{create_symlink, names_in, write_synced, ReadOnlyDirs, TestStore, DAY, HOUR},
-    support::TestEnv,
+    support::{open_lock_file, TestEnv},
     wrap_cargo::run_wrap_cargo,
 };
 use camino::{Utf8Path, Utf8PathBuf};
 use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
-use fs2::FileExt;
 use std::{
     ffi::OsStr,
     fs,
@@ -64,8 +63,8 @@ fn wait_for_background_gc(env: &TestEnv) {
 }
 
 fn wait_for_unlock(log_path: &Path) {
-    let log = fs::File::open(log_path).expect("opened the gc log");
-    log.lock_exclusive()
+    open_lock_file(log_path)
+        .lock()
         .expect("locked the gc log once the run was over");
 }
 
@@ -318,7 +317,7 @@ fn background_gc_gives_way_to_a_gc_that_is_running() {
     let orphan = create_large_orphan(&store);
     let workspace_dir = env.create_workspace("workspace");
     let gc_lock = fs::File::create(store.dir.join("gc.lock")).expect("created the gc lock");
-    gc_lock.lock_exclusive().expect("locked the gc lock");
+    gc_lock.lock().expect("locked the gc lock");
 
     wrap_cargo_and_wait(&env, &mut auto_targo(&env), &workspace_dir);
     assert!(orphan.exists());
@@ -594,8 +593,8 @@ fn background_gc_does_not_run_twice_at_once() {
     let log = read_log(&env);
 
     // As a run that started over a day ago and is still going: no result, and the log locked.
-    let held = fs::File::open(log_path(&env)).expect("opened the gc log");
-    held.lock_exclusive().expect("locked the gc log");
+    let held = open_lock_file(log_path(&env));
+    held.lock().expect("locked the gc log");
     set_last_run_started(&env, Utc::now() - TimeDelta::seconds(25 * HOUR));
     set_last_run(&env, "end", serde_json::Value::Null);
     let state = read_state(&env);
@@ -620,11 +619,11 @@ fn background_gc_is_detached_from_the_command_that_started_it() {
     // Locked and handed on as wrap-cargo does it.
     let log_path = env.root().join("log").into_std_path_buf();
     let log = fs::File::create(&log_path).expect("created the log");
-    log.lock_exclusive().expect("locked the log");
+    log.lock().expect("locked the log");
     let clone_log = || log.try_clone().expect("cloned the log");
     // With the store locked, the gc can't get past removing the orphan.
     let store_lock = fs::File::create(store.dir.join("targo.lock")).expect("created store lock");
-    store_lock.lock_exclusive().expect("locked the store");
+    store_lock.lock().expect("locked the store");
 
     let status = env
         .targo()

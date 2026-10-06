@@ -1,7 +1,6 @@
-use crate::support::{Entry, TestEnv};
+use crate::support::{open_lock_file, Entry, TestEnv};
 use camino::{Utf8Path, Utf8PathBuf};
 use chrono::{DateTime, FixedOffset, TimeDelta, Utc};
-use fs2::FileExt;
 use std::{
     collections::BTreeMap,
     fs,
@@ -275,8 +274,8 @@ fn gc_skips_an_entry_that_cargo_is_building_in() {
 
     // As Cargo holds them for the length of a build.
     let _cargo_locks = [&lock_path, &triple_lock_path].map(|path| {
-        let cargo_lock = fs::File::open(path).expect("opened Cargo's lock");
-        FileExt::lock_exclusive(&cargo_lock).expect("locked as Cargo does");
+        let cargo_lock = open_lock_file(path);
+        cargo_lock.lock().expect("locked as Cargo does");
         cargo_lock
     });
     let before = env.snapshot();
@@ -551,8 +550,8 @@ fn gc_does_nothing_while_another_gc_runs() {
     fs::write(&gc_lock_path, "").expect("created the gc lock");
 
     // As a running gc holds it.
-    let gc_lock = fs::File::open(&gc_lock_path).expect("opened the gc lock");
-    FileExt::lock_exclusive(&gc_lock).expect("locked as gc does");
+    let gc_lock = open_lock_file(&gc_lock_path);
+    gc_lock.lock().expect("locked as gc does");
     let before = env.snapshot();
     let output = run_gc(&env, &[]);
     assert_eq!(
@@ -1220,8 +1219,8 @@ fn gc_skips_a_live_entry_that_cargo_is_building_in() {
     let max_age = ["--max-age", "30d"];
 
     // As Cargo holds it for the length of a build.
-    let cargo_lock = fs::File::open(&lock_path).expect("opened Cargo's lock");
-    FileExt::lock_exclusive(&cargo_lock).expect("locked as Cargo does");
+    let cargo_lock = open_lock_file(&lock_path);
+    cargo_lock.lock().expect("locked as Cargo does");
     let before = env.snapshot();
     assert_eq!(
         stdout_of_success(&run_gc(&env, &max_age)),

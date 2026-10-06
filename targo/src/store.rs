@@ -610,8 +610,11 @@ fn truncate_with_hash(encoded: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fs2::FileExt;
-    use std::os::unix::{ffi::OsStringExt, fs::symlink};
+    use crate::helpers::tests::open_lock_file;
+    use std::{
+        fs::TryLockError,
+        os::unix::{ffi::OsStringExt, fs::symlink},
+    };
 
     /// A temp dir with paths for a store and a workspace's target dir.
     struct TestDirs {
@@ -643,8 +646,7 @@ mod tests {
 
         /// Opens the lock file again, so that a lock taken through it conflicts with the store's.
         fn lock_probe(&self) -> fs::File {
-            fs::File::open(self.store_dir.join(LockedStore::LOCK_FILE_NAME))
-                .expect("opened lock file")
+            open_lock_file(self.store_dir.join(LockedStore::LOCK_FILE_NAME))
         }
 
         fn set_up_target_dir(&self, store: LockedStore) -> TargetDirSetup {
@@ -673,7 +675,7 @@ mod tests {
 
         store.unlock().expect("unlocked store");
         probe
-            .try_lock_exclusive()
+            .try_lock()
             .expect("lock is free once the store is unlocked");
     }
 
@@ -691,7 +693,7 @@ mod tests {
             TargetDirSetup::DirectoryInTheWay => {}
         }
         probe
-            .try_lock_exclusive()
+            .try_lock()
             .expect("lock is free while the directory is still to be removed");
         assert!(old_file.exists(), "the directory is left to the caller");
         // The store below blocks on the lock unless the probe lets go of it.
@@ -745,7 +747,7 @@ mod tests {
             .expect("the store exists");
         let entries = store.entries().expect("listed entries");
         dirs.lock_probe()
-            .try_lock_exclusive()
+            .try_lock()
             .expect("the store lock is not taken to list entries");
 
         let actual: Vec<_> = entries
@@ -818,10 +820,9 @@ mod tests {
             error.to_string().starts_with(&expected),
             "error was: {error}"
         );
-        let moved_probe =
-            fs::File::open(moved_dir.join(LockedStore::LOCK_FILE_NAME)).expect("opened lock file");
+        let moved_probe = open_lock_file(moved_dir.join(LockedStore::LOCK_FILE_NAME));
         moved_probe
-            .try_lock_exclusive()
+            .try_lock()
             .expect("the lock is not kept after the failure");
         drop(moved_probe);
 
@@ -853,7 +854,7 @@ mod tests {
             TryLock::Busy => {}
         }
         dirs.lock_probe()
-            .try_lock_exclusive()
+            .try_lock()
             .expect("the store lock is another lock");
 
         gc_lock.unlock().expect("unlocked");
@@ -865,13 +866,12 @@ mod tests {
 
     // A shared probe is contended only by an exclusive lock.
     fn assert_contended(probe: &fs::File, when: &str) {
-        match FileExt::try_lock_shared(probe) {
+        match probe.try_lock_shared() {
             Ok(()) => panic!("{when}, the store lock is free, but the store should hold it"),
-            Err(error) => assert_eq!(
-                error.raw_os_error(),
-                fs2::lock_contended_error().raw_os_error(),
-                "{when}, taking the store lock fails because it is held: {error}"
-            ),
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Error(error)) => {
+                panic!("{when}, taking the store lock fails, but not because it is held: {error}")
+            }
         }
     }
 

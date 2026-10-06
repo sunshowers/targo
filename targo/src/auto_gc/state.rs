@@ -238,8 +238,10 @@ impl StateDir {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::gc::{ReportedSize, SizeBound};
-    use fs2::FileExt;
+    use crate::{
+        gc::{ReportedSize, SizeBound},
+        helpers::tests::open_lock_file,
+    };
 
     /// A state directory nested inside a temp dir.
     pub(in crate::auto_gc) struct TestStateDir {
@@ -483,13 +485,10 @@ pub(super) mod tests {
             "what was in the log is in the old log"
         );
         // The lock is on the new log, where the next `wrap-cargo` looks for it.
-        let probe = fs::File::open(state_dir.log_path()).expect("opened the log");
-        assert_eq!(
-            probe
-                .try_lock_exclusive()
-                .expect_err("the new log is locked")
-                .raw_os_error(),
-            fs2::lock_contended_error().raw_os_error()
-        );
+        let probe = open_lock_file(state_dir.log_path());
+        match try_lock_exclusive(probe).expect("tried the log lock") {
+            TryLock::Acquired(_) => panic!("the new log is locked"),
+            TryLock::Busy => {}
+        }
     }
 }

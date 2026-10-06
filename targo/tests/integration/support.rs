@@ -1,8 +1,12 @@
 use camino::{Utf8Path, Utf8PathBuf};
 use camino_tempfile::Utf8TempDir;
-use fs2::FileExt;
 use std::{
-    collections::BTreeMap, env, fs, os::unix::fs::PermissionsExt, process::Command,
+    collections::BTreeMap,
+    env,
+    fs::{self, TryLockError},
+    os::unix::fs::PermissionsExt,
+    path::Path,
+    process::Command,
     time::SystemTime,
 };
 
@@ -91,13 +95,12 @@ impl TestEnv {
     /// Reports the state of the store lock by trying to take it without blocking.
     pub(crate) fn store_lock_state(&self) -> StoreLockState {
         let lock_path = self.store_dir().join("targo.lock");
-        let probe = fs::File::open(&lock_path).expect("opened store lock file");
-        match probe.try_lock_exclusive() {
+        match open_lock_file(&lock_path).try_lock() {
             Ok(()) => StoreLockState::Free,
-            Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
-                StoreLockState::Held
+            Err(TryLockError::WouldBlock) => StoreLockState::Held,
+            Err(TryLockError::Error(error)) => {
+                panic!("failed to probe the lock at `{lock_path}`: {error}")
             }
-            Err(error) => panic!("failed to probe the lock at `{lock_path}`: {error}"),
         }
     }
 
@@ -155,6 +158,16 @@ impl TestEnv {
             .env("TARGO_AUTO_GC", "0");
         command
     }
+}
+
+/// Opens a lock file to probe or hold its lock.
+pub(crate) fn open_lock_file(path: impl AsRef<Path>) -> fs::File {
+    // Read-write, as Cargo opens its lock files.
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .expect("opened lock file")
 }
 
 fn record_entries(dir: &Utf8Path, entries: &mut BTreeMap<Utf8PathBuf, Entry>) {

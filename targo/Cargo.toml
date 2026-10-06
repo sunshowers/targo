@@ -2,6 +2,8 @@
 name = "targo"
 version = "0.1.0"
 edition = "2021"
+# The first release whose file locks work on illumos.
+rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
@@ -12,7 +14,6 @@ chrono = { version = "0.4.38", features = ["serde"] }
 clap = { version = "4.5.16", features = ["derive", "env"] }
 color-eyre = { version = "0.6.3", default-features = false }
 etcetera = "0.11.0"
-fs2 = "0.4.3"
 home = "0.5.9"
 humantime = "2.4.0"
 semver = { version = "1.0.23", features = ["serde"] }

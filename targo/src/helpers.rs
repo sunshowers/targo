@@ -5,10 +5,10 @@ use color_eyre::{
     eyre::{bail, Context},
     Result,
 };
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
-    fmt, fs,
+    fmt,
+    fs::{self, TryLockError},
     io::{self, Write},
     path::PathBuf,
 };
@@ -17,7 +17,7 @@ use std::{
 #[derive(Debug)]
 #[must_use]
 pub(crate) struct ExclusiveLock {
-    // Can't use cap_std::fs_utf8::File as it doesn't support fs2 or locking, sadly.
+    // Can't use cap_std::fs_utf8::File as it doesn't support locking, sadly.
     file: fs::File,
     lock_path: Utf8PathBuf,
 }
@@ -26,7 +26,7 @@ impl ExclusiveLock {
     /// Creates `lock_name` in `dir` if it doesn't exist, and blocks until it is locked.
     pub(crate) fn acquire(dir: &DirWithPath, lock_name: &str) -> Result<Self> {
         let (file, lock_path) = Self::open(dir, lock_name)?;
-        FileExt::lock_exclusive(&file)
+        file.lock()
             .wrap_err_with(|| format!("failed to obtain exclusive lock at `{lock_path}`"))?;
         Ok(Self { file, lock_path })
     }
@@ -58,7 +58,8 @@ impl ExclusiveLock {
 
     /// Releases the lock. Dropping releases it too, but cannot report a failure.
     pub(crate) fn unlock(self) -> Result<()> {
-        FileExt::unlock(&self.file)
+        self.file
+            .unlock()
             .wrap_err_with(|| format!("failed to release lock at `{}`", self.lock_path))
     }
 }
@@ -74,15 +75,12 @@ pub(crate) enum TryLock<T> {
 
 /// Tries to lock `file` exclusively without blocking. The lock is held until the file is dropped.
 ///
-/// This is `flock`, which is also how Cargo locks its build directories.
+/// This is the call that Cargo locks its build directories with.
 pub(crate) fn try_lock_exclusive(file: fs::File) -> io::Result<TryLock<fs::File>> {
-    // Called through the trait: `File` has locking methods of its own, with other error types.
-    match FileExt::try_lock_exclusive(&file) {
+    match file.try_lock() {
         Ok(()) => Ok(TryLock::Acquired(file)),
-        Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
-            Ok(TryLock::Busy)
-        }
-        Err(error) => Err(error),
+        Err(TryLockError::WouldBlock) => Ok(TryLock::Busy),
+        Err(TryLockError::Error(error)) => Err(error),
     }
 }
 
@@ -188,9 +186,19 @@ pub(crate) fn resolve_location(path: &Utf8Path) -> Result<PathBuf> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use std::os::unix::fs::symlink;
+    use std::{os::unix::fs::symlink, path::Path};
+
+    /// Opens a lock file to probe or hold its lock.
+    pub(crate) fn open_lock_file(path: impl AsRef<Path>) -> fs::File {
+        // Read-write, as Cargo opens its lock files.
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("opened lock file")
+    }
 
     #[test]
     fn test_resolve_location() {

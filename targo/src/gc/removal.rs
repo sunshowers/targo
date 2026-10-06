@@ -697,10 +697,9 @@ mod tests {
         },
         *,
     };
-    use crate::metadata::TargetDirMetadata;
+    use crate::{helpers::tests::open_lock_file, metadata::TargetDirMetadata};
     use camino::Utf8Path;
     use cap_std::ambient_authority;
-    use fs2::FileExt;
     use std::{
         collections::HashSet,
         os::unix::fs::{MetadataExt as _, PermissionsExt},
@@ -837,7 +836,7 @@ mod tests {
     }
 
     fn is_held(lock_path: &Utf8Path) -> bool {
-        let probe = fs::File::open(lock_path).expect("opened Cargo's lock");
+        let probe = open_lock_file(lock_path);
         match try_lock_exclusive(probe).expect("tried Cargo's lock") {
             TryLock::Acquired(_) => false,
             TryLock::Busy => true,
@@ -945,8 +944,8 @@ mod tests {
             let name = EntryName::new("entry");
 
             // As Cargo holds it for the length of a build.
-            let cargo_lock = fs::File::open(&lock_path).expect("opened Cargo's lock");
-            FileExt::lock_exclusive(&cargo_lock).expect("locked as Cargo does");
+            let cargo_lock = open_lock_file(&lock_path);
+            cargo_lock.lock().expect("locked as Cargo does");
             assert_eq!(
                 recheck_left(&store, &name),
                 Left::InUse(lock_path.clone().into()),
@@ -975,7 +974,7 @@ mod tests {
     #[test]
     fn test_recheck_leaves_an_entry_with_any_of_cargos_locks_held() {
         type Lock = fn(&fs::File) -> io::Result<()>;
-        let (shared, exclusive): (Lock, Lock) = (FileExt::lock_shared, FileExt::lock_exclusive);
+        let (shared, exclusive): (Lock, Lock) = (fs::File::lock_shared, fs::File::lock);
         let all: &[&str] = &CARGO_LOCK_NAMES;
         // Each case: a build directory's lock files, the one that Cargo holds, and how.
         let data: [(&[&str], &str, Lock); 7] = [
@@ -1006,7 +1005,7 @@ mod tests {
             };
 
             let held_path = build_dir.join(held_name);
-            let cargo_lock = fs::File::open(&held_path).expect("opened Cargo's lock");
+            let cargo_lock = open_lock_file(&held_path);
             lock_as_cargo(&cargo_lock).expect("locked as Cargo does");
             assert_eq!(
                 recheck_left(&store, &name),
@@ -1134,8 +1133,8 @@ mod tests {
         let name = EntryName::new("entry");
 
         // As Cargo holds it for the length of a build.
-        let cargo_lock = fs::File::open(&lock_path).expect("opened Cargo's lock");
-        FileExt::lock_exclusive(&cargo_lock).expect("locked as Cargo does");
+        let cargo_lock = open_lock_file(&lock_path);
+        cargo_lock.lock().expect("locked as Cargo does");
         assert_eq!(
             recheck_left_with(&store, &name, &max_age_policy()),
             Left::InUse(lock_path.clone().into())

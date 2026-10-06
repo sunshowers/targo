@@ -2,7 +2,7 @@
 
 use super::{
     classify, decide, find_build_dirs, BuildActivity, BuildDir, Clock, Decision, DiskUsage,
-    Emptying, GcPolicy, InUse, Measured, Outcome, PathErrors, Removal, UsageWalk, CARGO_LOCK_NAME,
+    Emptying, GcPolicy, InUse, Measured, Outcome, PathErrors, Removal, UsageWalk,
 };
 use crate::{
     helpers::{try_lock_exclusive, ExclusiveLock, TryLock},
@@ -209,13 +209,15 @@ pub(super) fn recheck<'a>(
     let build_activity = match find_build_dirs(entry_dir, entry_path) {
         Ok(build_dirs) => {
             for build_dir in &build_dirs {
-                match build_dir.try_lock()? {
-                    TryLock::Acquired(cargo_lock) => cargo_locks.push(cargo_lock),
-                    TryLock::Busy => {
-                        return Ok(Recheck::Leave(Outcome::InUse {
-                            name: name.clone(),
-                            reason: InUse::CargoLockHeld(build_dir.lock_path()),
-                        }));
+                for &lock_name in &build_dir.lock_names {
+                    match build_dir.try_lock(lock_name)? {
+                        TryLock::Acquired(cargo_lock) => cargo_locks.push(cargo_lock),
+                        TryLock::Busy => {
+                            return Ok(Recheck::Leave(Outcome::InUse {
+                                name: name.clone(),
+                                reason: InUse::CargoLockHeld(build_dir.lock_path(lock_name)),
+                            }));
+                        }
                     }
                 }
             }
@@ -258,19 +260,20 @@ pub(super) fn recheck<'a>(
 }
 
 impl BuildDir {
-    fn lock_path(&self) -> PathBuf {
-        self.path.join(CARGO_LOCK_NAME)
+    fn lock_path(&self, lock_name: &str) -> PathBuf {
+        self.path.join(lock_name)
     }
 
-    /// Tries to take the lock that Cargo holds while it builds in this directory.
-    fn try_lock(&self) -> Result<TryLock<fs::File>> {
+    /// Tries to take one of the locks that Cargo holds while it builds in this directory.
+    /// Cargo holds some of its locks shared, so the try is for an exclusive one.
+    fn try_lock(&self, lock_name: &str) -> Result<TryLock<fs::File>> {
         // Opened as Cargo opens it, but not created: a lock that isn't there isn't held.
         let mut options = OpenOptions::new();
         options.read(true).write(true);
-        let lock_error = || format!("failed to lock `{}`", self.lock_path().display());
+        let lock_error = || format!("failed to lock `{}`", self.lock_path(lock_name).display());
         let file = self
             .dir
-            .open_with(CARGO_LOCK_NAME, &options)
+            .open_with(lock_name, &options)
             .wrap_err_with(lock_error)?;
         try_lock_exclusive(file.into_std()).wrap_err_with(lock_error)
     }
@@ -690,7 +693,7 @@ mod tests {
         super::{
             examine,
             tests::{set_modified, test_store, utc, TestRoot},
-            ActivitySignal, KeepReason,
+            ActivitySignal, KeepReason, CARGO_LOCK_NAMES,
         },
         *,
     };
@@ -833,6 +836,14 @@ mod tests {
         names
     }
 
+    fn is_held(lock_path: &Utf8Path) -> bool {
+        let probe = fs::File::open(lock_path).expect("opened Cargo's lock");
+        match try_lock_exclusive(probe).expect("tried Cargo's lock") {
+            TryLock::Acquired(_) => false,
+            TryLock::Busy => true,
+        }
+    }
+
     #[test]
     fn test_recheck_leaves_an_entry_that_changed_after_it_was_listed() {
         // Each case is a change to an entry made after it was listed as one to remove.
@@ -932,13 +943,6 @@ mod tests {
             let lock_path = root.write_file(&format!("store/entry/{build_dir}/.cargo-lock"), 0);
             let store = test_store(&root);
             let name = EntryName::new("entry");
-            let is_held = |path: &Utf8Path| {
-                let probe = fs::File::open(path).expect("opened Cargo's lock");
-                match try_lock_exclusive(probe).expect("tried Cargo's lock") {
-                    TryLock::Acquired(_) => false,
-                    TryLock::Busy => true,
-                }
-            };
 
             // As Cargo holds it for the length of a build.
             let cargo_lock = fs::File::open(&lock_path).expect("opened Cargo's lock");
@@ -965,6 +969,62 @@ mod tests {
             );
             drop(permit);
             assert!(!is_held(&lock_path) && !is_held(&free_lock_path));
+        }
+    }
+
+    #[test]
+    fn test_recheck_leaves_an_entry_with_any_of_cargos_locks_held() {
+        type Lock = fn(&fs::File) -> io::Result<()>;
+        let (shared, exclusive): (Lock, Lock) = (FileExt::lock_shared, FileExt::lock_exclusive);
+        let all: &[&str] = &CARGO_LOCK_NAMES;
+        // Each case: a build directory's lock files, the one that Cargo holds, and how.
+        let data: [(&[&str], &str, Lock); 7] = [
+            (&[".cargo-lock"], ".cargo-lock", exclusive),
+            (&[".cargo-build-lock"], ".cargo-build-lock", exclusive),
+            (&[".cargo-artifact-lock"], ".cargo-artifact-lock", exclusive),
+            (all, ".cargo-lock", shared),
+            (all, ".cargo-build-lock", exclusive),
+            (all, ".cargo-build-lock", shared),
+            (all, ".cargo-artifact-lock", exclusive),
+        ];
+        for (lock_names, held_name, lock_as_cargo) in data {
+            let case = format!("with `{held_name}` of {lock_names:?} held");
+            let root = TestRoot::new();
+            write_orphan(&root, "entry");
+            let build_dir = root.create_dir("store/entry/target/debug");
+            for lock_name in lock_names {
+                root.write_file(&format!("store/entry/target/debug/{lock_name}"), 0);
+            }
+            let before = names_in(&build_dir);
+            let store = test_store(&root);
+            let name = EntryName::new("entry");
+            let held = || -> Vec<&str> {
+                let names = lock_names.iter().copied();
+                names
+                    .filter(|lock_name| is_held(&build_dir.join(lock_name)))
+                    .collect()
+            };
+
+            let held_path = build_dir.join(held_name);
+            let cargo_lock = fs::File::open(&held_path).expect("opened Cargo's lock");
+            lock_as_cargo(&cargo_lock).expect("locked as Cargo does");
+            assert_eq!(
+                recheck_left(&store, &name),
+                Left::InUse(held_path.into()),
+                "{case}"
+            );
+            assert_eq!(held(), [held_name], "{case}, the others are let go");
+
+            drop(cargo_lock);
+            let lock = store.lock().expect("locked store");
+            let permit = match recheck(&lock, &name, &policy(), &now).expect("rechecked") {
+                Recheck::Remove(permit) => permit,
+                recheck => panic!("{case}, the second look came to {recheck:?}"),
+            };
+            assert_eq!(held(), lock_names, "{case}, Cargo is kept out of each");
+            drop(permit);
+            assert_eq!(held(), [""; 0], "{case}");
+            assert_eq!(names_in(&build_dir), before, "{case}, none was created");
         }
     }
 
@@ -1072,13 +1132,6 @@ mod tests {
         let lock_path = root.write_file("store/entry/target/debug/.cargo-lock", 0);
         let store = test_store(&root);
         let name = EntryName::new("entry");
-        let is_held = || {
-            let probe = fs::File::open(&lock_path).expect("opened Cargo's lock");
-            match try_lock_exclusive(probe).expect("tried Cargo's lock") {
-                TryLock::Acquired(_) => false,
-                TryLock::Busy => true,
-            }
-        };
 
         // As Cargo holds it for the length of a build.
         let cargo_lock = fs::File::open(&lock_path).expect("opened Cargo's lock");
@@ -1094,9 +1147,12 @@ mod tests {
             Recheck::Empty(permit) => permit,
             recheck => panic!("the second look came to {recheck:?}"),
         };
-        assert!(is_held(), "Cargo is kept out while the contents are moved");
+        assert!(
+            is_held(&lock_path),
+            "Cargo is kept out while the contents are moved"
+        );
         drop(permit);
-        assert!(!is_held());
+        assert!(!is_held(&lock_path));
     }
 
     #[test]

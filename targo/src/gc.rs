@@ -641,8 +641,9 @@ impl Liveness {
 /// The directory in an entry that a workspace's `target` symlink leads to.
 const TARGET_DIR_NAME: &str = "target";
 
-/// The lock file that Cargo holds while it builds in a directory.
-const CARGO_LOCK_NAME: &str = ".cargo-lock";
+/// The lock files that Cargo holds while it builds in a directory. Up to Cargo 1.95 there is
+/// only the first; a build directory apart from the target directory has only the second.
+const CARGO_LOCK_NAMES: [&str; 3] = [".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"];
 
 /// Where rustc's outputs go in a build directory, up to Cargo 1.99.
 const OLD_OUTPUT_DIR_NAME: &str = "deps";
@@ -656,24 +657,39 @@ const UNITS_DIR_NAME: &str = "build";
 /// In a unit's directory: rustc's outputs, and the unit's fingerprint.
 const UNIT_DIR_NAMES: [&str; 2] = ["out", "fingerprint"];
 
-/// A directory that Cargo builds in, which is one with a `.cargo-lock` in it.
+/// A directory that Cargo builds in: one with any of Cargo's lock files in it.
 #[derive(Debug)]
 struct BuildDir {
     dir: Dir,
     path: PathBuf,
+    /// The lock files that it has; there is at least one.
+    lock_names: Vec<&'static str>,
 }
 
 impl BuildDir {
-    /// Returns `None` if `dir` has no `.cargo-lock`.
+    /// Returns `None` if `dir` has none of Cargo's lock files.
     fn new(dir: Dir, path: PathBuf) -> Result<Option<Self>, PathError> {
-        match dir.symlink_metadata(CARGO_LOCK_NAME) {
-            Ok(_) => Ok(Some(Self { dir, path })),
-            Err(error) if is_absent(&error) => Ok(None),
-            Err(error) => Err(PathError {
-                path: path.join(CARGO_LOCK_NAME),
-                error,
-            }),
+        let mut lock_names = Vec::new();
+        for lock_name in CARGO_LOCK_NAMES {
+            match dir.symlink_metadata(lock_name) {
+                Ok(_) => lock_names.push(lock_name),
+                Err(error) if is_absent(&error) => {}
+                Err(error) => {
+                    return Err(PathError {
+                        path: path.join(lock_name),
+                        error,
+                    })
+                }
+            }
         }
+        if lock_names.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            dir,
+            path,
+            lock_names,
+        }))
     }
 
     /// Newest mtime of the directories that a compile changes. A failed compile changes only
@@ -2598,6 +2614,43 @@ mod tests {
         assert_activity(Some(new), "with the newest at depth 2");
         set_tool_triple_debug(newer);
         assert_activity(Some(newer), "with the newest at depth 3");
+    }
+
+    #[test]
+    fn test_build_dir_is_found_by_any_of_cargos_lock_files() {
+        let all: &[&str] = &CARGO_LOCK_NAMES;
+        let data: [&[&str]; 5] = [
+            &[".cargo-lock"],
+            &[".cargo-build-lock"],
+            &[".cargo-artifact-lock"],
+            &[".cargo-lock", ".cargo-build-lock"],
+            all,
+        ];
+        let built = utc("2026-03-01T12:00:00Z");
+        for lock_names in data {
+            let root = TestRoot::new();
+            let entry = root.create_dir("store/entry");
+            for lock_name in lock_names {
+                root.write_file(&format!("store/entry/target/debug/{lock_name}"), 0);
+            }
+            set_modified(&root.create_dir("store/entry/target/debug/deps"), built);
+            let newer = utc("2026-03-08T12:00:00Z");
+            root.write_file("store/entry/target/release/.cargo-lock.bak", 0);
+            set_modified(&root.create_dir("store/entry/target/release/deps"), newer);
+
+            let entry_dir = Dir::open_ambient_dir(&entry, ambient_authority()).expect("opened");
+            let build_dirs =
+                find_build_dirs(&entry_dir, entry.as_std_path()).expect("found build dirs");
+            let found: Vec<_> = build_dirs
+                .iter()
+                .map(|build_dir| (build_dir.path.as_path(), build_dir.lock_names.as_slice()))
+                .collect();
+            assert_eq!(
+                found,
+                [(entry.join("target/debug").as_std_path(), lock_names)]
+            );
+            assert_last_built(&entry, Some(built), &format!("with {lock_names:?}"));
+        }
     }
 
     #[test]

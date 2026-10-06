@@ -840,6 +840,31 @@ mod tests {
     }
 
     #[test]
+    fn test_unlocked_store_does_not_leave_through_a_symlink_ending_in_a_slash() {
+        let dirs = TestDirs::new();
+        let store = open_unlocked_store(&dirs);
+        let outside_dir = dirs.store_dir.with_file_name("outside");
+        let entry_dir = dirs.store_dir.join("entry");
+        for dir in [&outside_dir, &entry_dir] {
+            fs::create_dir(dir).expect("created dir");
+        }
+        for (parent, link_name) in [(&dirs.store_dir, "linked-entry"), (&entry_dir, "target")] {
+            symlink(&outside_dir, parent.join("hop")).expect("created symlink out of the store");
+            // With the slash, the OS follows `hop` even when told not to follow symlinks.
+            symlink("hop/", parent.join(link_name)).expect("created symlink ending in a slash");
+        }
+
+        let error = store
+            .open_entry_dir(&EntryName::new("linked-entry"))
+            .expect_err("the entry directory is outside the store");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        let error = store
+            .open_entry_target_dir(&EntryName::new("entry"))
+            .expect_err("the target directory is outside the entry");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
     fn test_gc_lock_does_not_block() {
         let dirs = TestDirs::new();
         let store = open_unlocked_store(&dirs);

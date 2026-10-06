@@ -6,10 +6,9 @@ use crate::{
 use camino::{Utf8Path, Utf8PathBuf};
 use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use std::{
-    ffi::OsStr,
     fs,
     io::{self, BufRead, BufReader},
-    os::unix::fs::PermissionsExt,
+    os::unix::{fs::PermissionsExt, process::CommandExt},
     path::Path,
     process::{Command, Output, Stdio},
 };
@@ -128,6 +127,58 @@ fn set_last_run(env: &TestEnv, field: &str, value: serde_json::Value) {
 
 fn set_last_run_started(env: &TestEnv, started: DateTime<Utc>) {
     set_last_run(env, "started", serde_json::json!(started));
+}
+
+/// The id of a process, with those of its parent and of its process group.
+#[derive(Debug, PartialEq, Eq)]
+struct ProcessIds {
+    pid: u32,
+    parent: u32,
+    group: u32,
+}
+
+/// Every process there is, zombies among them. Reads `/proc` as Linux lays it out.
+#[cfg(target_os = "linux")]
+fn all_processes() -> Vec<ProcessIds> {
+    fs::read_dir("/proc")
+        .expect("read /proc")
+        .filter_map(|entry| {
+            let dir = entry.ok()?.path();
+            let pid = dir.file_name()?.to_str()?.parse().ok()?;
+            // A process can exit while this runs, so one that can't be read is left out.
+            let stat = fs::read_to_string(dir.join("stat")).ok()?;
+            // The fields after the command name, which can itself hold spaces.
+            let (_, fields) = stat.rsplit_once(')')?;
+            let mut fields = fields.split_whitespace();
+            let _state = fields.next()?;
+            let parent = fields.next()?.parse().ok()?;
+            let group = fields.next()?.parse().ok()?;
+            Some(ProcessIds { pid, parent, group })
+        })
+        .collect()
+}
+
+/// Every process there is, zombies among them.
+#[cfg(not(target_os = "linux"))]
+fn all_processes() -> Vec<ProcessIds> {
+    // One `-o` for each column: a header runs to the end of its argument.
+    let output = Command::new("ps")
+        .args(["-A", "-o", "pid=", "-o", "ppid=", "-o", "pgid="])
+        .stderr(Stdio::inherit())
+        .output()
+        .expect("ran ps");
+    assert!(output.status.success(), "ps exited with {}", output.status);
+    let stdout = String::from_utf8(output.stdout).expect("the output of ps is UTF-8");
+    stdout
+        .lines()
+        .map(|line| {
+            let ids: Option<Vec<u32>> = line.split_whitespace().map(|id| id.parse().ok()).collect();
+            let Some(&[pid, parent, group]) = ids.as_deref() else {
+                panic!("ps printed {line:?}, and not three ids");
+            };
+            ProcessIds { pid, parent, group }
+        })
+        .collect()
 }
 
 #[test]
@@ -541,8 +592,6 @@ fn background_gc_keeps_the_entry_of_the_workspace_that_started_it() {
     );
 }
 
-// Reads `/proc` as Linux lays it out.
-#[cfg(target_os = "linux")]
 #[test]
 fn background_gc_is_not_left_as_a_child_of_cargo() {
     let env = TestEnv::new();
@@ -567,17 +616,9 @@ fn background_gc_is_not_left_as_a_child_of_cargo() {
     wait_for_background_gc(&env);
 
     // A process that targo started and didn't wait for would be listed here, alive or as a zombie.
-    let children: Vec<_> = fs::read_dir("/proc")
-        .expect("read /proc")
-        .filter_map(|entry| {
-            let stat = fs::read_to_string(entry.ok()?.path().join("stat")).ok()?;
-            // The fields after the command name, which can itself hold spaces.
-            let (_, fields) = stat.rsplit_once(')')?;
-            let parent: u32 = fields.split_whitespace().nth(1)?.parse().ok()?;
-            (parent == child.id()).then_some(stat)
-        })
-        .collect();
-    assert_eq!(children, [""; 0], "Cargo has no children");
+    let mut children = all_processes();
+    children.retain(|process| process.parent == child.id());
+    assert_eq!(children, [], "Cargo has no children");
 
     drop(child.stdin.take());
     let status = child.wait().expect("waited for stand-in cargo");
@@ -605,8 +646,6 @@ fn background_gc_does_not_run_twice_at_once() {
     drop(held);
 }
 
-// Reads `/proc` as Linux lays it out.
-#[cfg(target_os = "linux")]
 #[test]
 fn background_gc_is_detached_from_the_command_that_started_it() {
     let env = TestEnv::new();
@@ -625,36 +664,25 @@ fn background_gc_is_detached_from_the_command_that_started_it() {
     let store_lock = fs::File::create(store.dir.join("targo.lock")).expect("created store lock");
     store_lock.lock().expect("locked the store");
 
-    let status = env
+    let mut starter = env
         .targo()
         .args(["spawn-auto-gc", &Utc::now().to_rfc3339()])
         .stdin(fs::File::open(&starter_stdin).expect("opened file"))
         .stdout(clone_log())
         .stderr(clone_log())
-        .status()
-        .expect("ran the starter");
+        // A process group of its own, as wrap-cargo gives it.
+        .process_group(0)
+        .spawn()
+        .expect("spawned the starter");
+    let status = starter.wait().expect("waited for the starter");
     assert!(status.success(), "the starter exited with {status}");
 
-    let gc_dir = fs::read_dir("/proc")
-        .expect("read /proc")
-        .filter_map(|entry| Some(entry.ok()?.path()))
-        .find(|dir| fs::read_link(dir.join("fd/1")).is_ok_and(|dest| dest == log_path))
-        .expect("the gc is running, with the log as its stdout");
-    let stat = fs::read_to_string(gc_dir.join("stat")).expect("read stat");
-    // The fields after the command name: state, parent, process group.
-    let (_, fields) = stat.rsplit_once(')').expect("stat has a command name");
-    assert_eq!(
-        fields.split_whitespace().nth(2).map(OsStr::new),
-        gc_dir.file_name(),
-        "the gc leads a process group of its own"
-    );
-    let dest_of = |name: &str| fs::read_link(gc_dir.join(name)).expect("read link");
-    assert_eq!(dest_of("cwd"), Path::new("/"));
-    assert_eq!(
-        dest_of("fd/0"),
-        Path::new("/dev/null"),
-        "the gc is not left with the starter's stdin"
-    );
+    // The gc is still running: it can't end while the store is locked.
+    let mut left_in_group = all_processes();
+    left_in_group.retain(|process| process.group == starter.id());
+    assert_eq!(left_in_group, [], "the gc left the starter's process group");
+    #[cfg(target_os = "linux")]
+    assert_proc_shows_a_detached_gc(&log_path);
 
     drop(store_lock);
     drop(log);
@@ -663,6 +691,24 @@ fn background_gc_is_detached_from_the_command_that_started_it() {
         !orphan.exists(),
         "the gc ran to its end, and the log was:\n{}",
         fs::read_to_string(&log_path).expect("read the log")
+    );
+}
+
+// Reads `/proc` as Linux lays it out.
+#[cfg(target_os = "linux")]
+fn assert_proc_shows_a_detached_gc(log_path: &Path) {
+    let link_of = |pid: u32, name: &str| fs::read_link(format!("/proc/{pid}/{name}"));
+    let gc = all_processes()
+        .into_iter()
+        .find(|process| link_of(process.pid, "fd/1").is_ok_and(|dest| dest == log_path))
+        .expect("the gc is running, with the log as its stdout");
+    assert_eq!(gc.group, gc.pid, "the gc leads a process group of its own");
+    let dest_of = |name: &str| link_of(gc.pid, name).expect("read link");
+    assert_eq!(dest_of("cwd"), Path::new("/"));
+    assert_eq!(
+        dest_of("fd/0"),
+        Path::new("/dev/null"),
+        "the gc is not left with the starter's stdin"
     );
 }
 

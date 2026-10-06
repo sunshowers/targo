@@ -113,7 +113,7 @@ impl TestEnv {
             "#!/bin/sh\n\
              if [ \"$1\" = locate-project ]; then exec {real_cargo} \"$@\"; fi\n\
              echo ready\n\
-             read -r _\n\
+             read -r line\n\
              exit 0\n"
         );
         let path = self.root.join("waiting-cargo");
@@ -135,6 +135,7 @@ impl TestEnv {
 
     /// A command that runs `program` in its own mount namespace, with `source` also
     /// mounted at `mount_point`.
+    #[cfg(target_os = "linux")]
     pub(crate) fn command_in_namespace_with_bind_mount(
         &self,
         source: &Utf8Path,
@@ -151,6 +152,7 @@ impl TestEnv {
     }
 
     /// Whether such a command can run. If not, says that the test is skipped.
+    #[cfg(target_os = "linux")]
     pub(crate) fn can_bind_mount_in_namespace(
         &self,
         source: &Utf8Path,

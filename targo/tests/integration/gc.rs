@@ -701,6 +701,8 @@ fn gc_reports_an_entry_that_it_cannot_delete_and_carries_on() {
     assert_eq!(names_in(&trash), [""; 0]);
 }
 
+// Mounts in a namespace of its own, which only Linux has.
+#[cfg(target_os = "linux")]
 #[test]
 fn gc_deletes_nothing_under_a_mount_point_on_the_store_filesystem() {
     let env = TestEnv::new();

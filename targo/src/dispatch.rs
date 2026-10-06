@@ -1,11 +1,12 @@
 use crate::{
+    auto_gc,
     cargo_cli::{CargoCli, CargoOutput},
     gc::{self, GcMode, GcPolicy, GcStatus},
     helpers::resolve_location,
     store::{remove_target_dir, LockedStore, TargetDirSetup},
 };
 use camino::{Utf8Path, Utf8PathBuf};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueHint};
 use color_eyre::{
     eyre::{bail, WrapErr},
@@ -68,7 +69,12 @@ pub enum TargoCommand {
             value_parser = parse_max_age,
         )]
         max_age: Option<Duration>,
+
+        #[arg(long, hide = true, value_name = "STARTED", conflicts_with = "dry_run")]
+        auto: Option<DateTime<Utc>>,
     },
+    #[command(hide = true)]
+    SpawnAutoGc { started: DateTime<Utc> },
 }
 
 /// The environment variable that sets `--max-age` for `targo gc`.
@@ -95,17 +101,22 @@ impl TargoApp {
                 dry_run,
                 orphan_grace,
                 max_age,
+                auto,
             } => {
-                let mode = if dry_run {
-                    GcMode::DryRun
-                } else {
-                    GcMode::Remove
-                };
                 let policy = GcPolicy {
                     orphan_grace,
                     max_age,
                 };
-                exec_gc(mode, policy)
+                match (auto, dry_run) {
+                    // clap refuses `--auto` with `--dry-run`.
+                    (Some(started), _) => exec_background_gc(started, policy),
+                    (None, true) => exec_gc(GcMode::DryRun, policy),
+                    (None, false) => exec_gc(GcMode::Remove, policy),
+                }
+            }
+            TargoCommand::SpawnAutoGc { started } => {
+                auto_gc::spawn_detached(started)?;
+                Ok(ExitCode::SUCCESS)
             }
         }
     }
@@ -124,9 +135,11 @@ fn exec_wrap_cargo(args: Vec<OsString>) -> Result<ExitCode> {
             // Find the target directory destination.
             let store_dir = choose_store_dir(store_dir_override)?;
             let store = set_up_target_dir(&store_dir, &workspace_dir, &target_dir)?;
+            let auto_gc = auto_gc::decide(&store);
 
             // Cargo must not run under the store lock: a build can take a long time.
             store.unlock()?;
+            auto_gc.finish(&workspace_dir);
 
             parsed_args
         }
@@ -151,19 +164,36 @@ const GC_BUSY_EXIT_CODE: u8 = 75;
 
 fn exec_gc(mode: GcMode, policy: GcPolicy) -> Result<ExitCode> {
     let store_dir = choose_store_dir(store_dir_override_from_env()?)?;
-    let status = gc::run(
+    run_gc(store_dir, mode, &policy).map(gc_exit_code)
+}
+
+/// The run that wrap-cargo started at `started`; its output is the gc log.
+fn exec_background_gc(started: DateTime<Utc>, policy: GcPolicy) -> Result<ExitCode> {
+    let store_dir = choose_store_dir(store_dir_override_from_env()?)?;
+    let result = run_gc(store_dir.clone(), GcMode::Background, &policy);
+    auto_gc::record_end(&store_dir, started, result).map(gc_exit_code)
+}
+
+fn run_gc(store_dir: Utf8PathBuf, mode: GcMode, policy: &GcPolicy) -> Result<GcStatus> {
+    gc::run(
         store_dir,
         mode,
-        &policy,
+        policy,
         &Utc::now,
         &mut io::stdout().lock(),
         &mut io::stderr().lock(),
-    )?;
-    Ok(match status {
-        GcStatus::Completed => ExitCode::SUCCESS,
-        GcStatus::Failed => ExitCode::FAILURE,
+    )
+}
+
+fn gc_exit_code(status: GcStatus) -> ExitCode {
+    match status {
+        GcStatus::Finished(summary) => match summary.failed {
+            0 => ExitCode::SUCCESS,
+            _ => ExitCode::FAILURE,
+        },
         GcStatus::AnotherGcRunning => ExitCode::from(GC_BUSY_EXIT_CODE),
-    })
+        GcStatus::NoLiveEntry => ExitCode::SUCCESS,
+    }
 }
 
 /// Opens the store and points `target_dir` into it. The store is returned still locked.
@@ -456,7 +486,7 @@ impl fmt::Display for ManifestPathError {
 impl error::Error for ManifestPathError {}
 
 /// The environment variable that overrides the store directory.
-const STORE_DIR_ENV: &str = "TARGO_STORE_DIR";
+pub(crate) const STORE_DIR_ENV: &str = "TARGO_STORE_DIR";
 
 fn store_dir_override_from_env() -> Result<Option<Utf8PathBuf>, StoreDirEnvError> {
     parse_store_dir_override(std::env::var_os(STORE_DIR_ENV))
@@ -680,7 +710,9 @@ mod tests {
                 TargoCommand::WrapCargo { args } => {
                     assert_eq!(args, input, "clap passes arguments through unchanged");
                 }
-                TargoCommand::Gc { .. } => panic!("for {input:?}, clap parsed a gc command"),
+                TargoCommand::Gc { .. } | TargoCommand::SpawnAutoGc { .. } => {
+                    panic!("for {input:?}, clap parsed another command")
+                }
             }
         }
     }
@@ -708,14 +740,18 @@ mod tests {
                     orphan_grace,
                     // Not given here, so it is whatever the environment of the test sets.
                     max_age: _,
+                    auto,
                 } => {
+                    assert_eq!(auto, None, "for {input:?}");
                     assert_eq!(
                         (dry_run, orphan_grace),
                         (expected_dry_run, expected_grace),
                         "for {input:?}"
                     );
                 }
-                TargoCommand::WrapCargo { .. } => panic!("for {input:?}, clap parsed wrap-cargo"),
+                TargoCommand::WrapCargo { .. } | TargoCommand::SpawnAutoGc { .. } => {
+                    panic!("for {input:?}, clap parsed another command")
+                }
             }
         }
 
@@ -734,7 +770,9 @@ mod tests {
                         "for {input:?}"
                     );
                 }
-                TargoCommand::WrapCargo { .. } => panic!("for {input:?}, clap parsed wrap-cargo"),
+                TargoCommand::WrapCargo { .. } | TargoCommand::SpawnAutoGc { .. } => {
+                    panic!("for {input:?}, clap parsed another command")
+                }
             }
         }
 
@@ -753,6 +791,48 @@ mod tests {
             let error = parse(input).expect_err("clap rejects the arguments");
             assert_eq!(error.kind(), expected, "for {input:?}: {error}");
         }
+    }
+
+    #[test]
+    fn test_background_gc_args_from_clap() {
+        let started: DateTime<Utc> = "2026-03-08T19:00:00.123456789Z"
+            .parse()
+            .expect("parsed timestamp");
+        let parse = |args: &[String]| {
+            let app_args = iter::once("targo").chain(args.iter().map(String::as_str));
+            TargoApp::try_parse_from(app_args)
+        };
+
+        // The arguments that wrap-cargo and the starter build are the ones clap takes.
+        match parse(&auto_gc::starter_args(started))
+            .expect("parsed")
+            .command
+        {
+            TargoCommand::SpawnAutoGc { started: parsed } => assert_eq!(parsed, started),
+            TargoCommand::WrapCargo { .. } | TargoCommand::Gc { .. } => {
+                panic!("clap parsed another command")
+            }
+        }
+        match parse(&auto_gc::background_gc_args(started))
+            .expect("parsed")
+            .command
+        {
+            TargoCommand::Gc { dry_run, auto, .. } => {
+                assert_eq!((dry_run, auto), (false, Some(started)));
+            }
+            TargoCommand::WrapCargo { .. } | TargoCommand::SpawnAutoGc { .. } => {
+                panic!("clap parsed another command")
+            }
+        }
+
+        let mut with_dry_run = auto_gc::background_gc_args(started).to_vec();
+        with_dry_run.push("--dry-run".to_owned());
+        let error = parse(&with_dry_run).expect_err("clap rejects the arguments");
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+
+        let not_a_time = ["gc".to_owned(), "--auto".to_owned(), "now".to_owned()];
+        let error = parse(&not_a_time).expect_err("clap rejects the arguments");
+        assert_eq!(error.kind(), ErrorKind::ValueValidation);
     }
 
     #[test]

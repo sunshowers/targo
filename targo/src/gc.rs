@@ -10,6 +10,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use cap_std::fs::{Dir, DirEntry, Metadata, MetadataExt as _};
 use chrono::{DateTime, Utc};
 use color_eyre::{eyre::WrapErr, Report, Result};
+use serde::{Deserialize, Serialize};
 use std::{
     cmp::Reverse,
     collections::HashSet,
@@ -35,6 +36,8 @@ pub(crate) enum GcMode {
     /// Report what would be removed or emptied, and change nothing.
     DryRun,
     Remove,
+    /// As `Remove`, for a run that wrap-cargo started; leaves a store with no live entry alone.
+    Background,
 }
 
 impl GcMode {
@@ -48,7 +51,7 @@ impl GcMode {
                 and_empty: "empty",
                 and_keep: "keep",
             },
-            Self::Remove => Wording {
+            Self::Remove | Self::Background => Wording {
                 remove: "removed",
                 empty: "emptied",
                 keep: "kept",
@@ -56,6 +59,14 @@ impl GcMode {
                 and_empty: "emptied",
                 and_keep: "kept",
             },
+        }
+    }
+
+    /// No live entry usually means the workspaces can't be seen from here, not that they are gone.
+    fn needs_live_entry(self) -> bool {
+        match self {
+            Self::DryRun | Self::Remove => false,
+            Self::Background => true,
         }
     }
 }
@@ -76,11 +87,23 @@ struct Wording {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use]
 pub(crate) enum GcStatus {
-    Completed,
-    /// At least one entry could not be removed or emptied. Each failure has been reported.
-    Failed,
+    /// The run finished; each failure has been reported.
+    Finished(GcSummary),
     /// Another gc run holds `gc.lock`, so this one did nothing.
     AnotherGcRunning,
+    /// A background run found no live entry, and did nothing.
+    NoLiveEntry,
+}
+
+/// What a run removed and emptied or, in a dry run, would have.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct GcSummary {
+    pub(crate) removed: usize,
+    pub(crate) emptied: usize,
+    /// Counts leftovers in the trash as well as entries.
+    pub(crate) failed: usize,
+    pub(crate) freed: ReportedSize,
 }
 
 /// Gives the current time.
@@ -108,12 +131,12 @@ pub(crate) fn run(
             "nothing to collect: there is no targo store at `{store_dir}`"
         ));
         output.finish()?;
-        return Ok(GcStatus::Completed);
+        return Ok(GcStatus::Finished(GcSummary::default()));
     };
 
     let mut collector = match mode {
         GcMode::DryRun => Collector::DryRun,
-        GcMode::Remove => match Remover::start(&store, clock())? {
+        GcMode::Remove | GcMode::Background => match Remover::start(&store, clock())? {
             TryLock::Acquired(remover) => Collector::Remove(remover),
             TryLock::Busy => {
                 output.failure(format_args!(
@@ -127,15 +150,19 @@ pub(crate) fn run(
     };
     let wording = mode.wording();
     let mut tally = Tally::default();
-    collector.remove_leftovers(&mut tally, &mut output)?;
 
     let now = clock();
     let mut collections = Vec::new();
     let mut kept_lines = Vec::new();
+    let mut live_entries = 0_usize;
     for entry in store.entries()? {
         match entry {
             StoreEntry::Recognized { name, metadata } => {
                 let entry = examine(&store, name, metadata, now, policy);
+                match entry.liveness() {
+                    Liveness::Live => live_entries += 1,
+                    Liveness::Orphaned | Liveness::Unknown => {}
+                }
                 match decide(&entry, now, policy) {
                     Decision::RemoveOrphan { idle, signal } => {
                         collections.push(Collection::Remove(Removal {
@@ -163,6 +190,18 @@ pub(crate) fn run(
             }
         }
     }
+    // Checked before anything is deleted, leftovers included.
+    if mode.needs_live_entry() && live_entries == 0 {
+        output.line(format_args!(
+            "left the store at `{store_dir}` alone: none of its entries is live, which usually \
+             means that the workspaces can't be seen from here (as in another container, or with \
+             a disk that isn't mounted) and not that they are gone; `targo gc` collects it anyway"
+        ));
+        output.finish()?;
+        return Ok(GcStatus::NoLiveEntry);
+    }
+    collector.remove_leftovers(&mut tally, &mut output)?;
+
     // Oldest first. The sort is stable, so entries that are as old stay in name order.
     collections.sort_by_key(|collection| Reverse(collection.idle()));
 
@@ -209,7 +248,7 @@ pub(crate) fn run(
     }
     output.line(summary_line(wording, policy, &tally));
     output.finish()?;
-    Ok(tally.status())
+    Ok(GcStatus::Finished(tally.summary()))
 }
 
 /// The report on `out` and the failures on `err`. Once a write fails, nothing more is written.
@@ -256,11 +295,14 @@ struct Tally {
 }
 
 impl Tally {
-    fn status(&self) -> GcStatus {
-        if self.removed.failed + self.emptied.failed + self.failed_leftovers > 0 {
-            GcStatus::Failed
-        } else {
-            GcStatus::Completed
+    fn summary(&self) -> GcSummary {
+        let mut freed = self.removed.freed;
+        freed.add_size(self.emptied.freed);
+        GcSummary {
+            removed: self.removed.entries,
+            emptied: self.emptied.entries,
+            failed: self.removed.failed + self.emptied.failed + self.failed_leftovers,
+            freed,
         }
     }
 }
@@ -1291,18 +1333,20 @@ impl UsageWalk {
 }
 
 /// Whether a size is exact or a lower bound.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum SizeBound {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum SizeBound {
     #[default]
     Exact,
     AtLeast,
 }
 
 /// A size to report, which is a lower bound if part of it could not be measured.
-#[derive(Debug, Default)]
-struct ReportedSize {
-    bytes: u64,
-    bound: SizeBound,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct ReportedSize {
+    pub(crate) bytes: u64,
+    pub(crate) bound: SizeBound,
 }
 
 impl ReportedSize {
@@ -1316,6 +1360,14 @@ impl ReportedSize {
         self.bytes = self.bytes.saturating_add(usage.bytes);
         if usage.unmeasured.is_some() {
             self.bound = SizeBound::AtLeast;
+        }
+    }
+
+    fn add_size(&mut self, other: Self) {
+        self.bytes = self.bytes.saturating_add(other.bytes);
+        match other.bound {
+            SizeBound::Exact => {}
+            SizeBound::AtLeast => self.bound = SizeBound::AtLeast,
         }
     }
 }
@@ -1506,7 +1558,7 @@ impl fmt::Display for BacklinkList<'_> {
 }
 
 /// A count of entries, such as `1 entry`.
-struct Entries(usize);
+pub(crate) struct Entries(pub(crate) usize);
 
 impl fmt::Display for Entries {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2930,14 +2982,23 @@ mod tests {
             summary_line(dry_wording, &with_max_age, &tally),
             format!("would remove 1 entry (1.0 KiB), empty 2 entries (3.0 KiB), and keep {kept}")
         );
-        assert_eq!(tally.status(), GcStatus::Completed);
+        let collected = GcSummary {
+            removed: 1,
+            emptied: 2,
+            failed: 0,
+            freed: ReportedSize {
+                bytes: 4096,
+                bound: SizeBound::Exact,
+            },
+        };
+        assert_eq!(tally.summary(), collected);
 
         tally.removed.failed += 2;
         assert_eq!(
             summary_line(wording, &orphans_only, &tally),
             format!("removed 1 entry (1.0 KiB), failed to remove 2 entries, and kept {kept}")
         );
-        assert_eq!(tally.status(), GcStatus::Failed);
+        assert_eq!(tally.summary().failed, 2);
 
         tally.removed.failed = 0;
         tally.emptied.failed += 1;
@@ -2948,13 +3009,17 @@ mod tests {
                  failed to empty 1 entry, and kept {kept}"
             )
         );
-        assert_eq!(tally.status(), GcStatus::Failed);
+        assert_eq!(tally.summary().failed, 1);
+
+        // A lower-bound size makes the total a lower bound.
+        tally.emptied.freed.bound = SizeBound::AtLeast;
+        assert_eq!(tally.summary().freed.bound, SizeBound::AtLeast);
 
         let leftover_failed = Tally {
             failed_leftovers: 1,
             ..Tally::default()
         };
-        assert_eq!(leftover_failed.status(), GcStatus::Failed);
+        assert_eq!(leftover_failed.summary().failed, 1);
     }
 
     #[test]

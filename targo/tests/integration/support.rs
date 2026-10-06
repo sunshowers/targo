@@ -150,7 +150,9 @@ impl TestEnv {
             // Anything derived from the home directory stays in the temp dir.
             .env("HOME", self.root.join("home"))
             // A `cargo` found through `PATH` may be a wrapper that depends on `CARGO_HOME`.
-            .env("CARGO", env!("CARGO"));
+            .env("CARGO", env!("CARGO"))
+            // Off by default, or every wrap-cargo test would start a background gc that races it.
+            .env("TARGO_AUTO_GC", "0");
         command
     }
 }

@@ -16,8 +16,8 @@ use std::{
     time::SystemTime,
 };
 
-const HOUR: i64 = 60 * 60;
-const DAY: i64 = 24 * HOUR;
+pub(crate) const HOUR: i64 = 60 * 60;
+pub(crate) const DAY: i64 = 24 * HOUR;
 
 /// The exit code of a gc that did nothing because another one was running.
 const GC_BUSY_EXIT_CODE: i32 = 75;
@@ -1657,8 +1657,8 @@ fn gc_dry_run_stops_quietly_when_stdout_is_closed() {
 }
 
 /// A store written by hand, so that entries can have any last-used time.
-struct TestStore {
-    dir: Utf8PathBuf,
+pub(crate) struct TestStore {
+    pub(crate) dir: Utf8PathBuf,
     now: DateTime<Utc>,
 }
 
@@ -1672,7 +1672,7 @@ enum OutputLayout {
 }
 
 impl TestStore {
-    fn new(env: &TestEnv) -> Self {
+    pub(crate) fn new(env: &TestEnv) -> Self {
         let dir = env.store_dir();
         fs::create_dir(&dir).expect("created store dir");
         fs::write(
@@ -1710,7 +1710,7 @@ impl TestStore {
     }
 
     /// Creates an entry that a workspace links to, and returns its directory and the link.
-    fn create_live_entry(
+    pub(crate) fn create_live_entry(
         &self,
         env: &TestEnv,
         name: &str,
@@ -1725,7 +1725,7 @@ impl TestStore {
     /// Creates an entry last used `last_used_secs` after the store was created.
     ///
     /// Half a unit away from a whole one, the age shown can't depend on how long the test takes.
-    fn create_entry(
+    pub(crate) fn create_entry(
         &self,
         name: &str,
         backlinks: &[&Utf8Path],
@@ -1749,13 +1749,13 @@ impl TestStore {
 }
 
 /// Writes a file and syncs it, so that the size the filesystem reports for it is settled.
-fn write_synced(path: &Utf8Path, contents: &[u8]) {
+pub(crate) fn write_synced(path: &Utf8Path, contents: &[u8]) {
     let mut file = fs::File::create(path).expect("created file");
     file.write_all(contents).expect("wrote file");
     file.sync_all().expect("synced file");
 }
 
-fn create_symlink(dest: &Utf8Path, link: &Utf8Path) {
+pub(crate) fn create_symlink(dest: &Utf8Path, link: &Utf8Path) {
     fs::create_dir_all(link.parent().expect("link has a parent")).expect("created dir");
     symlink(dest, link).expect("created symlink");
 }
@@ -1802,7 +1802,7 @@ fn subtree<'a>(
         .collect()
 }
 
-fn names_in(dir: &Utf8Path) -> Vec<String> {
+pub(crate) fn names_in(dir: &Utf8Path) -> Vec<String> {
     let mut names: Vec<_> = dir
         .read_dir_utf8()
         .expect("read directory")
@@ -1823,11 +1823,11 @@ fn create_cargo_lock(entry_dir: &Utf8Path, build_dir: &str) -> Utf8PathBuf {
 /// Directories named `read-only` that nothing can be removed from, until this is dropped.
 ///
 /// Gc moves them, so they are found again by name.
-struct ReadOnlyDirs(Utf8PathBuf);
+pub(crate) struct ReadOnlyDirs(Utf8PathBuf);
 
 impl ReadOnlyDirs {
     /// Returns `None` if permissions are not enforced, as when running as root.
-    fn new(env: &TestEnv, dir: &Utf8Path) -> Option<Self> {
+    pub(crate) fn new(env: &TestEnv, dir: &Utf8Path) -> Option<Self> {
         assert_eq!(dir.file_name(), Some("read-only"));
         fs::set_permissions(dir, fs::Permissions::from_mode(0o555))
             .expect("removed write permission");

@@ -466,7 +466,7 @@ fn wrap_cargo_fails_when_cargo_cannot_be_run() {
 }
 
 /// Runs `targo wrap-cargo version` in `workspace_dir`, which must succeed.
-fn run_wrap_cargo(command: &mut Command, workspace_dir: &Utf8Path) -> Output {
+pub(crate) fn run_wrap_cargo(command: &mut Command, workspace_dir: &Utf8Path) -> Output {
     let output = command
         .current_dir(workspace_dir)
         .args(["wrap-cargo", "version"])

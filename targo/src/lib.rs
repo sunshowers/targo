@@ -1,3 +1,4 @@
+mod auto_gc;
 mod cargo_cli;
 mod config;
 mod dispatch;

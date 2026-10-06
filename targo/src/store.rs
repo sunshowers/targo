@@ -58,6 +58,10 @@ impl LockedStore {
         self.lock.unlock()
     }
 
+    pub(crate) fn path(&self) -> &Utf8Path {
+        self.store_dir.path()
+    }
+
     /// Points `target_dir` into the store, unless a real directory is in the way.
     pub(crate) fn set_up_target_dir(
         self,
@@ -547,7 +551,7 @@ const HASH_SUFFIX_LEN: usize = 8;
 /// - `C:\Users\rain\dev` → `C_c_bUsers_brain_bdev`
 /// - `/path_with_underscore` → `_spath__with__underscore`
 /// - `/weird*path?` → `_sweird_apath_m`
-fn encode_workspace_path(path: &Utf8Path) -> String {
+pub(crate) fn encode_workspace_path(path: &Utf8Path) -> String {
     let mut encoded = String::with_capacity(path.as_str().len() * 2);
 
     for ch in path.as_str().chars() {

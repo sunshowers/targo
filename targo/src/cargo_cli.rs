@@ -1,8 +1,16 @@
-use color_eyre::{
-    eyre::{bail, Context},
-    Result,
+use color_eyre::{eyre::Context, Result};
+use std::{
+    ffi::OsString,
+    fmt,
+    process::{Command, ExitStatus},
 };
-use std::{ffi::OsString, fmt, process::Command};
+
+/// How a Cargo command that was run for its output ended.
+#[derive(Clone, Debug)]
+pub(crate) enum CargoOutput {
+    Success { stdout: Vec<u8> },
+    Failed { status: ExitStatus, stderr: String },
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct CargoCli {
@@ -37,25 +45,25 @@ impl CargoCli {
         &self.args
     }
 
-    pub(crate) fn stdout_output(&self) -> Result<Vec<u8>> {
+    /// An error here means that Cargo couldn't be run at all.
+    pub(crate) fn output(&self) -> Result<CargoOutput> {
         let mut command = self.make_command();
-        let output = command
-            .output()
-            .wrap_err_with(|| format!("failed to run `{self}`"))?;
-        if !output.status.success() {
-            let mut message = format!("command `{self}` failed");
-            if let Some(code) = output.status.code() {
-                message.push_str(&format!(" with exit code {code}"));
-            }
-            message.push_str("\n\n--- stdout ---\n");
-            message.push_str(&String::from_utf8_lossy(&output.stdout));
-            message.push_str("\n\n--- stderr ---\n");
-            message.push_str(&String::from_utf8_lossy(&output.stderr));
-
-            bail!(message);
+        let output = command.output().wrap_err_with(|| {
+            format!(
+                "failed to run `{self}` (Cargo is taken from the `CARGO` environment variable, \
+                 or from `PATH` if that is unset)"
+            )
+        })?;
+        if output.status.success() {
+            Ok(CargoOutput::Success {
+                stdout: output.stdout,
+            })
+        } else {
+            Ok(CargoOutput::Failed {
+                status: output.status,
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            })
         }
-
-        Ok(output.stdout)
     }
 
     pub(crate) fn run_or_exec(&self) -> Result<()> {

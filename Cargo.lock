@@ -752,7 +752,6 @@ dependencies = [
  "fs2",
  "home",
  "humantime",
- "libc",
  "semver",
  "serde",
  "serde_json",

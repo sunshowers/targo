@@ -20,7 +20,7 @@ use std::{
     ffi::{OsStr, OsString},
     fmt, fs,
     io::{self, Write},
-    os::{fd::RawFd, unix::process::CommandExt},
+    os::unix::process::CommandExt,
     path::Path,
     process::{Command, Stdio},
 };
@@ -419,7 +419,6 @@ pub(crate) fn background_gc_args(started: DateTime<Utc>) -> [String; 3] {
 /// Spawns the gc and doesn't wait: the starter then exits, so the gc is never a child of Cargo.
 pub(crate) fn spawn_detached(started: DateTime<Utc>) -> Result<()> {
     let targo = env::current_exe().wrap_err("failed to find the targo executable")?;
-    close_inherited_fds_on_exec()?;
     // Stdout and stderr are inherited, and are the locked gc log.
     Command::new(&targo)
         .args(background_gc_args(started))
@@ -430,31 +429,6 @@ pub(crate) fn spawn_detached(started: DateTime<Utc>) -> Result<()> {
         .process_group(0)
         .spawn()
         .wrap_err_with(|| format!("failed to run `{}`", targo.display()))?;
-    Ok(())
-}
-
-/// Keeps from the gc whatever else the Cargo command was given, such as a pipe that its caller
-/// reads to the end.
-fn close_inherited_fds_on_exec() -> Result<()> {
-    const FD_DIR: &str = "/dev/fd";
-    let read_error = || format!("failed to read `{FD_DIR}`");
-    for dir_entry in fs::read_dir(FD_DIR).wrap_err_with(read_error)? {
-        let name = dir_entry.wrap_err_with(read_error)?.file_name();
-        let fd: RawFd = name
-            .to_str()
-            .and_then(|name| name.parse().ok())
-            .ok_or_else(|| eyre!("`{FD_DIR}` has {name:?} in it, which is not a descriptor"))?;
-        if fd <= libc::STDERR_FILENO {
-            continue;
-        }
-        // SAFETY: `fcntl` with `F_SETFD` takes integers only, so it touches no memory of this
-        // process, and it closes nothing; a descriptor that is not open is answered with `EBADF`.
-        let result = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
-        if result == -1 {
-            return Err(io::Error::last_os_error())
-                .wrap_err_with(|| format!("failed to set close-on-exec on descriptor {fd}"));
-        }
-    }
     Ok(())
 }
 

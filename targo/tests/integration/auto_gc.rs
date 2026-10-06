@@ -11,7 +11,7 @@ use std::{
     fs,
     io::{self, BufRead, BufReader},
     os::unix::fs::PermissionsExt,
-    path::{Path, PathBuf},
+    path::Path,
     process::{Command, Output, Stdio},
 };
 
@@ -614,9 +614,9 @@ fn background_gc_is_detached_from_the_command_that_started_it() {
     let store = TestStore::new(&env);
     let orphan = store.create_entry("orphan", &[], -400 * DAY);
     store.create_live_entry(&env, "live", 0);
-    let inherited = env.root().join("inherited");
-    fs::write(&inherited, "").expect("wrote file");
-    let open_inherited = || fs::File::open(&inherited).expect("opened file");
+    // Not `/dev/null`, so that the gc's stdin can be told from the starter's.
+    let starter_stdin = env.root().join("starter-stdin");
+    fs::write(&starter_stdin, "").expect("wrote file");
     // Locked and handed on as wrap-cargo does it.
     let log_path = env.root().join("log").into_std_path_buf();
     let log = fs::File::create(&log_path).expect("created the log");
@@ -626,14 +626,10 @@ fn background_gc_is_detached_from_the_command_that_started_it() {
     let store_lock = fs::File::create(store.dir.join("targo.lock")).expect("created store lock");
     store_lock.lock_exclusive().expect("locked the store");
 
-    // The starter, with a stdin and a third descriptor that the gc must not be left with.
     let status = env
-        .confined_command("sh")
-        .args(["-c", r#"exec "$0" spawn-auto-gc "$1" 3<"$2""#])
-        .arg(env!("CARGO_BIN_EXE_targo"))
-        .arg(Utc::now().to_rfc3339())
-        .arg(&inherited)
-        .stdin(open_inherited())
+        .targo()
+        .args(["spawn-auto-gc", &Utc::now().to_rfc3339()])
+        .stdin(fs::File::open(&starter_stdin).expect("opened file"))
         .stdout(clone_log())
         .stderr(clone_log())
         .status()
@@ -655,15 +651,10 @@ fn background_gc_is_detached_from_the_command_that_started_it() {
     );
     let dest_of = |name: &str| fs::read_link(gc_dir.join(name)).expect("read link");
     assert_eq!(dest_of("cwd"), Path::new("/"));
-    assert_eq!(dest_of("fd/0"), Path::new("/dev/null"));
-    // Read leniently, since the gc opens and closes files of its own meanwhile.
-    let open_files: Vec<PathBuf> = fs::read_dir(gc_dir.join("fd"))
-        .expect("read the descriptors of the gc")
-        .filter_map(|entry| fs::read_link(entry.ok()?.path()).ok())
-        .collect();
-    assert!(
-        !open_files.contains(&inherited.clone().into_std_path_buf()),
-        "the gc has {open_files:?} open"
+    assert_eq!(
+        dest_of("fd/0"),
+        Path::new("/dev/null"),
+        "the gc is not left with the starter's stdin"
     );
 
     drop(store_lock);

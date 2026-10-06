@@ -80,6 +80,7 @@ Set `TARGO_AUTO_GC=0` in your environment. No background run starts, and `targo 
 
 * gc judges an entry by whether its `target` links can be seen from where gc runs. If a store is shared between environments that see different paths (containers, a disk that is sometimes unmounted), entries used only from elsewhere look orphaned, and are removed once they have gone unused for the grace period. In such an environment, set `TARGO_AUTO_GC=0`, and give any `targo gc` you run by hand a longer `--orphan-grace`.
 * gc removes or empties whole target directories. It does not trim stale build output inside one that is in regular use, so a long-lived target still grows. A plain `cargo clean` does not help: it removes only the `target` link (as of Cargo 1.99), and the next command through targo links the same entry again. `cargo clean --profile dev` and `cargo clean -p <package>` do delete through the link.
+* A background run keeps any file descriptors that the Cargo command was started with, other than stdin, stdout, and stderr, until it ends. A script that runs Cargo under `flock` can find the lock still held for that long; `flock -o` avoids this.
 * Like the rest of targo, gc is Unix only.
 
 ## About
